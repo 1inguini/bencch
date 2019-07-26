@@ -5,87 +5,110 @@ module Main where
 -- import qualified Data.List                     as List
 -- import           Data.Map.Strict               ((!?))
 -- import qualified Data.Map.Strict               as Map
--- import qualified Data.Maybe                    as May
+import qualified Data.Maybe                    as May
 -- import qualified Data.Text.Lazy                as TLazy
 -- import qualified System.Console.Haskeline      as HLine
 -- import qualified System.Environment            as Env
 import           Data.Int
+import qualified Data.Text.Lazy                as TLazy
 import qualified Safe                          as Safe
 import qualified System.Environment            as Env
 import qualified Text.Parsec                   as P
 import           Text.ParserCombinators.Parsec
+import qualified Text.Pretty.Simple            as PrettyS
 
-makeSrc :: Int -> [CToken] -> [String] -> [String]
-makeSrc varNum inputs accm =
-  case Safe.headMay inputs of
-    Just (CReserved "+") -> makeSrc (varNum + 4) (tail inputs)
-                (accm
-                  ++ ("  %" ++ show varNum ++ " = load i32, i32* %" ++ show (varNum - 2) ++ ", align 4")
-                  :  ("  %" ++ show (varNum + 1) ++ " = load i32, i32* %" ++ show (varNum - 1) ++ ", align 4")
-                  :  ("  %" ++ show (varNum + 2) ++ " = add nsw i32 %" ++ show varNum ++ ", %" ++ show (varNum + 1))
-                  :   ""
-                  :  ("  %" ++ show (varNum + 3) ++ " = alloca i32, align 4")
-                  :  ("  store i32 %" ++ show (varNum + 2) ++ ", i32* %" ++ show (varNum + 3) ++ ", align 4")
-                  :"":"":[])
+data CLeaf = CReserved Reserved
+           | CInt32    Int32
+           | EOF
+           deriving Show
 
-    Just (CReserved "-") -> makeSrc (varNum + 4) (tail inputs)
-                (accm
-                  ++ ("  %" ++ show varNum ++ " = load i32, i32* %" ++ show (varNum - 2) ++ ", align 4")
-                  :  ("  %" ++ show (varNum + 1) ++ " = load i32, i32* %" ++ show (varNum - 1) ++ ", align 4")
-                  :  ("  %" ++ show (varNum + 2) ++ " = sub nsw i32 %" ++ show varNum ++ ", %" ++ show (varNum + 1))
-                  :   ""
-                  :  ("  %" ++ show (varNum + 3) ++ " = alloca i32, align 4")
-                  :  ("  store i32 %" ++ show (varNum + 2) ++ ", i32* %" ++ show (varNum + 3) ++ ", align 4")
-                  :"":"":[])
+data Reserved = Add
+              | Sub
+              | Mul
+              | Div
+              | Unknown
+              deriving Show
 
-    Just (CInt32 num) -> makeSrc (varNum + 1) (tail inputs)
-                (accm
-                  ++ ("  %" ++ show varNum ++ " = alloca i32, align 4")
-                  :  ("  store i32 " ++ show num ++ ", i32* %" ++ show varNum ++ ", align 4")
-                  :"":"":[])
+data CTree = Branch [CTree]
+           | Leaf   CLeaf
+           deriving Show
 
-    Nothing -> (accm
-               ++ ("  %" ++ show varNum ++ " = load i32, i32* %" ++ show (varNum - 1) ++ ", align 4")
-               :  ("  ret i32 %" ++ show varNum)
-               :   "}":[])
+makeSrc :: [String] -> CTree -> [String]
+makeSrc accm (Branch []) = accm
+makeSrc accm (Branch (tree:treeList)) =
+  makeSrc generated $ Branch treeList
+  where
+    generated = makeSrc accm tree
+makeSrc accm (Leaf (CReserved func)) = accm ++ generated
+  where
+    generated = stackExec (matchLLVMCommand $ func)
+makeSrc accm (Leaf (CInt32 num)) = accm ++ push num
+makeSrc accm (Leaf EOF) = accm
 
-data CToken = CReserved String
-            | CInt32    Int32
-            | EOF
+matchLLVMCommand :: Reserved -> [String]
+matchLLVMCommand func =
+  case func of
+    Add -> "    add rax,rdi":"    push rax":[]
+    Sub -> "    sub rax,rdi":"    push rax":[]
+    Mul -> "    imul rax,rdi":"    push rax":[]
+    Div -> "    cqo":"    idiv rdi":"    push rax":[]
+
+push :: Int32 -> [String]
+push num
+  = ("    push " ++ show num):"":[]
+
+stackExec :: [String] -> [String]
+stackExec func
+  = "    pop rdi":"    pop rax":func ++ "":[]
 
 symbol :: Parser Char
-symbol = oneOf "+-"
+symbol = oneOf "+-*/"
 
-parser :: Parser [CToken]
-parser = do
-  num1 <- spaces >> CInt32 . read <$> many1 digit
-  rest <- (do
-              addsub <- spaces >> CReserved <$> many1 symbol
-              number <- spaces >> CInt32 . read <$> many1 digit
-              return $ number:[addsub])
-          `manyTill` eof
-  return $ [num1] ++ foldl1 (++) rest
+mainParser, parseExpr, parseMul, parseTerm, parseNum :: Parser CTree
 
--- parser :: Parser [String]
--- parser = do
---   num1 <- spaces >> many1 digit
---   rest <- (do
---               addsub <- spaces >> symbol
---               number <- spaces >> many1 digit
---               return $ number:[[addsub]])
---           `manyTill` eof
---   return $ [num1] ++ foldl1 (++) rest
+mainParser = spaces >> ((P.try $ do { eof; return $ Leaf EOF})
+                        <|> parseExpr)
+
+parseExpr = do
+  mul0 <- spaces >> parseMul
+  rest <- many (P.try $ do
+                   arthmetic <- spaces >> matchReserved <$> many1 (oneOf "+-")
+                   mul <- spaces >> parseMul
+                   return $ mul:[arthmetic])
+  return . Branch $ mul0:(May.maybe ([]) (id) $ Safe.foldl1May (++) rest)
+
+parseMul = do
+  mul0 <- parseTerm
+  rest <- many (try $ do
+                   arthmetic <- spaces >> matchReserved <$> many1 (oneOf "*/")
+                   mul <- spaces >> parseTerm
+                   return $ mul:[arthmetic])
+  return . Branch $ mul0:(May.maybe ([]) (id) $ Safe.foldl1May (++) rest)
+
+parseTerm =
+  spaces >>
+  (P.try parseNum
+   <|> between (char '(') (char ')') parseExpr)
+
+parseNum = Leaf . CInt32 . read <$> many1 digit
+
+matchReserved :: String -> CTree
+matchReserved x =
+  Leaf . CReserved
+  $ case x of
+      "+" -> Add
+      "-" -> Sub
+      "*" -> Mul
+      "/" -> Div
+      _   -> Unknown
 
 main :: IO ()
 main = do
   input <- head <$> Env.getArgs
-  case parse parser "" input of
-    Right val ->
+  case parse mainParser "" input of
+    Right val -> do
+      -- putStr . TLazy.unpack . PrettyS.pShow $ val
       mapM_ putStrLn
-      $ makeSrc 1 val
-      [ "define i32 @main() {"]
+        $ code ++ "    pop rax":"    ret":[]
+        where code = (makeSrc (".intel_syntax noprefix":".global main":"main:":[]) val)
     Left err  -> putStrLn $ show err
-
-  -- mapM_ putStrLn
-  --   $ makeSrc 1 input
-  --   [ "define i32 @main() {"]

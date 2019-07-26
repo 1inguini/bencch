@@ -6,7 +6,10 @@ try() {
     expected="$1"
     input="$2"
 
-    stack run "$input" | lli
+    stack run "$input" > tmp.s
+    clang -o tmp tmp.s
+    ./tmp
+    # stack run "$input" | lli
     
     actual=$?
     
