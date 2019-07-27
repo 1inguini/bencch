@@ -6,8 +6,9 @@ try() {
     expected="$1"
     input="$2"
 
-    stack run "$input" > tmp.s
-    clang -o tmp tmp.s
+    stack run "$input" > tmp.asm
+    nasm -o tmp.o -felf64 tmp.asm
+    ld -o tmp tmp.o
     ./tmp
     # stack run "$input" | lli
     

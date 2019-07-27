@@ -48,10 +48,10 @@ makeSrc accm (Leaf EOF) = accm
 matchLLVMCommand :: Reserved -> [String]
 matchLLVMCommand func =
   case func of
-    Add -> "    add rax,rdi":"    push rax":[]
-    Sub -> "    sub rax,rdi":"    push rax":[]
-    Mul -> "    imul rax,rdi":"    push rax":[]
-    Div -> "    cqo":"    idiv rdi":"    push rax":[]
+    Add -> "    add rax, rbx":"    push rax":[]
+    Sub -> "    sub rax, rbx":"    push rax":[]
+    Mul -> "    mul rbx":"    push rax":[]
+    Div -> "    div rbx":"    push rax":[]
 
 push :: Int32 -> [String]
 push num
@@ -59,7 +59,7 @@ push num
 
 stackExec :: [String] -> [String]
 stackExec func
-  = "    pop rdi":"    pop rax":func ++ "":[]
+  = "    pop rbx":"    pop rax":func ++ "":[]
 
 symbol :: Parser Char
 symbol = oneOf "+-*/"
@@ -109,6 +109,10 @@ main = do
     Right val -> do
       -- putStr . TLazy.unpack . PrettyS.pShow $ val
       mapM_ putStrLn
-        $ code ++ "    pop rax":"    ret":[]
-        where code = (makeSrc (".intel_syntax noprefix":".global main":"main:":[]) val)
+        $ code ++ "_exit:":"    mov rax, 1":"    pop rbx":"    int 0x80":[]
+        where code = (makeSrc (-- ".intel_syntax noprefix":".global main":
+                               "section .text":
+                               "global _start":
+                               "":
+                               "_start:":[]) val)
     Left err  -> putStrLn $ show err

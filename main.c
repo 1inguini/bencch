@@ -1,5 +1,6 @@
 int main() {
-    int a = 1;
-    int b = 2;
-    return (a * b);
+    int a = 11;
+    int b = 23;
+    int c = a + b;
+    return (c);
 }
