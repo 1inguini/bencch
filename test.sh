@@ -6,7 +6,7 @@ try() {
     expected="$1"
     input="$2"
 
-    stack run "$input" > tmp.asm
+    stack run -- "$input" > tmp.asm
     nasm -o tmp.o -felf64 tmp.asm
     ld -o tmp tmp.o
     ./tmp
@@ -22,10 +22,18 @@ try() {
     fi
 }
 
-try "$((4 + 13 - 2))" '4 + 13 - 2';
+try "$((4 + 13 - 2))" '4 + 13 - 2;';
 
-try "$((255 - 34 + 1 - 50 + 67))" '255 - 34 + 1 - 50 + 67'
+try "$((255 - 34 + 1 - 50 + 67))" '255 - 34 + 1 - 50 + 67;'
 
-try "$(($1))" "$1" 
+try "$((100-3))" "100-3;"
+
+try "$((100-(3+5)))" "100-(3+5);"
+
+try "$((100-3*+5))" "100-3*+5;"
+ 
+try 12 "a=12;a;"
+
+try "$(echo $1 | bc)" "$1"
 
 echo OK

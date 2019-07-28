@@ -1,6 +1,10 @@
+// mからnまでを足す
+int sum(m, n) {
+    int acc = 0;
+    for (int i = m; i <= n; i = i + 1) acc = acc + i;
+    return acc;
+}
+
 int main() {
-    int a = 11;
-    int b = 23;
-    int c = a + b;
-    return (c);
+    return sum(1, 10);  // 55を返す
 }
