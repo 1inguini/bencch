@@ -49,23 +49,23 @@ data CTree = Branch [CTree]
            | Leaf   CLeaf
            deriving Show
 
--- makeSrc :: [String] -> CTree -> [String]
--- makeSrc accm (Branch []) = accm
--- makeSrc accm (Branch (tree:treeList)) =
---   makeSrc generated $ Branch treeList
---   where
---     generated = makeSrc accm tree
--- makeSrc accm (Leaf (CReserved func)) = accm ++ generated
---   where
---     generated = stackExec (matchLLVMCommand $ func)
--- makeSrc accm (Leaf (CInt num)) = accm ++ push num
--- makeSrc accm (Leaf (LVar theoffset True)) = accm ++ generated
---   where
---     generated = stackAssign theoffset
--- makeSrc accm (Leaf (LVar theoffset False)) = accm ++ generated
---   where
---     generated = stackLoadLval theoffset
--- makeSrc accm (Leaf EOF) = accm
+makeSrc :: [String] -> CTree -> [String]
+makeSrc accm (Branch []) = accm
+makeSrc accm (Branch (tree:treeList)) =
+  makeSrc generated $ Branch treeList
+  where
+    generated = makeSrc accm tree
+makeSrc accm (Leaf (CReserved func)) = accm ++ generated
+  where
+    generated = stackExec (matchLLVMCommand $ func)
+makeSrc accm (Leaf (CInt num)) = accm ++ push num
+makeSrc accm (Leaf (LVar theoffset True)) = accm ++ generated
+  where
+    generated = stackAssign theoffset
+makeSrc accm (Leaf (LVar theoffset False)) = accm ++ generated
+  where
+    generated = stackLoadLval theoffset
+makeSrc accm (Leaf EOF) = accm
 
 matchLLVMCommand :: Reserved -> [String]
 matchLLVMCommand func =
@@ -100,19 +100,19 @@ stackLoadLval theoffset =
   "    pop     rax":"    mov     rax, [rax]":"    push    rax":[]
 
 genLVal :: Integer -> [String]
-genLVal theoffset = "    mov     rax, rbp":("  sub rax, " ++ show theoffset):"    push    rax":[]
+genLVal theoffset = "    mov     rax, rbp":("    sub     rax, " ++ show theoffset):"    push    rax":[]
 
 symbol :: Parser Char
 symbol = oneOf "+-*/"
 
-mainParser :: Parser CTree
-mainParser =  spaces >> (Branch <$> parseStatements empty)
+mainParser :: Parser (Locals, CTree)
+mainParser =  spaces >> (parseStatements empty)
   where
-    parseStatements :: Locals -> Parser [CTree]
+    parseStatements :: Locals -> Parser (Locals, CTree)
     parseStatements locals = do
-      (l, stmt) <- parseStmt locals
-      stmts <- spaces >> option [] (P.try $ parseStatements l)
-      return $ stmt:stmts
+      (l0, stmt) <- parseStmt locals
+      (l1, stmts) <- spaces >> option (l0, Leaf EOF) (P.try $ parseStatements l0)
+      return $ (l1, Branch $ stmt:stmts:[])
 
 parseStmt, parseExpr, parseAssign, parseEquality, parseRelational, parseMul, parseAdd, parseUnary, parseTerm, parseNum
   :: Locals -> Parser (Locals, CTree)
@@ -234,50 +234,50 @@ matchReserved x =
       _    -> Unknown
 
 
--- codeGen :: CTree -> IO ()
--- codeGen val =
---       mapM_ putStrLn
---         $ code ++
---         "":
---         "; epiloge":
---         "":
---         "    pop     rax":
---         "    mov     rbx, rax":
---         "    mov     rsp, rbp":
---         "    pop     rbp":
---         "    ret":
---         "":
---         "":[]
---         where code = (makeSrc ( "section .text"
---                               : "global _start"
---                               : ""
---                               : "_start:"
---                               : "    call    main"
---                               : ""
---                               : "_exit:"
---                               : "    mov     rax, 1"
---                               -- : "    pop     rbx"
---                               : "    int     0x80"
---                               : ""
---                               : "main:"
---                               : "; prologe"
---                               : ""
---                               : "    push    rbp"
---                               : "    mov     rbp, rsp"
---                               : "    sub     rsp, 208"
---                               : ""
---                               : ""
---                               : "; generated code"
---                               : "":[]) val)
+codeGen :: Locals -> CTree -> IO ()
+codeGen locals val =
+      mapM_ putStrLn
+        $ code ++
+        "":
+        "; epiloge":
+        "":
+        "    pop     rax":
+        "    mov     rbx, rax":
+        "    mov     rsp, rbp":
+        "    pop     rbp":
+        "    ret":
+        "":
+        "":[]
+        where code = (makeSrc ( "section .text"
+                              : "global _start"
+                              : ""
+                              : "_start:"
+                              : "    call    main"
+                              : ""
+                              : "_exit:"
+                              : "    mov     rax, 1"
+                              -- : "    pop     rbx"
+                              : "    int     0x80"
+                              : ""
+                              : "main:"
+                              : "; prologe"
+                              : ""
+                              : "    push    rbp"
+                              : "    mov     rbp, rsp"
+                              :("    sub     rsp, " ++ show (Safe.maximumDef 0 (elems locals)))
+                              : ""
+                              : ""
+                              : "; generated code"
+                              : "":[]) val)
 
 
 main :: IO ()
 main = do
   input <- head <$> Env.getArgs
   case parse mainParser "" input of
-    Right val -> do
-      putStr . TLazy.unpack . PrettyS.pShow $ val
-      -- codeGen val
+    Right (l, val) -> do
+      -- putStr . TLazy.unpack . PrettyS.pShow $ val
+      codeGen l val
     Left err  -> putStrLn $ show err
 
 debugmain :: String -> IO ()

@@ -24,6 +24,7 @@ dependencies:
 - safe
 - parsec
 - megaparsec
+- containers
 # - llvm-hs-pure
 # - llvm-hs
 
