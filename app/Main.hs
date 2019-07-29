@@ -4,7 +4,7 @@ module Main where
 -- import qualified Data.Either                   as E
 -- import qualified Data.List                     as List
 -- import           Data.Map.Strict               ((!?))
--- import qualified Data.Map.Strict               as Map
+import           Data.Map.Strict               as Map
 import qualified Data.Maybe                    as May
 -- import qualified Data.Text.Lazy                as TLazy
 -- import qualified System.Console.Haskeline      as HLine
@@ -21,12 +21,16 @@ import           Text.ParserCombinators.Parsec
 import qualified Text.Pretty.Simple            as PrettyS
 
 data CLeaf = CReserved Reserved
-           | Ident Char
-           | LVar { offset   :: Integer
-                  , isassign :: Bool}
            | CInt      Int
+           | LVar { offset   :: Offset
+                  , isassign :: Bool}
            | EOF
            deriving Show
+
+type VarName = String
+type Offset = Integer
+
+type Locals = Map VarName Offset
 
 data Reserved = Add
               | Sub
@@ -45,23 +49,23 @@ data CTree = Branch [CTree]
            | Leaf   CLeaf
            deriving Show
 
-makeSrc :: [String] -> CTree -> [String]
-makeSrc accm (Branch []) = accm
-makeSrc accm (Branch (tree:treeList)) =
-  makeSrc generated $ Branch treeList
-  where
-    generated = makeSrc accm tree
-makeSrc accm (Leaf (CReserved func)) = accm ++ generated
-  where
-    generated = stackExec (matchLLVMCommand $ func)
-makeSrc accm (Leaf (CInt num)) = accm ++ push num
-makeSrc accm (Leaf (LVar theoffset True)) = accm ++ generated
-  where
-    generated = stackAssign theoffset
-makeSrc accm (Leaf (LVar theoffset False)) = accm ++ generated
-  where
-    generated = stackLoadLval theoffset
-makeSrc accm (Leaf EOF) = accm
+-- makeSrc :: [String] -> CTree -> [String]
+-- makeSrc accm (Branch []) = accm
+-- makeSrc accm (Branch (tree:treeList)) =
+--   makeSrc generated $ Branch treeList
+--   where
+--     generated = makeSrc accm tree
+-- makeSrc accm (Leaf (CReserved func)) = accm ++ generated
+--   where
+--     generated = stackExec (matchLLVMCommand $ func)
+-- makeSrc accm (Leaf (CInt num)) = accm ++ push num
+-- makeSrc accm (Leaf (LVar theoffset True)) = accm ++ generated
+--   where
+--     generated = stackAssign theoffset
+-- makeSrc accm (Leaf (LVar theoffset False)) = accm ++ generated
+--   where
+--     generated = stackLoadLval theoffset
+-- makeSrc accm (Leaf EOF) = accm
 
 matchLLVMCommand :: Reserved -> [String]
 matchLLVMCommand func =
@@ -101,85 +105,115 @@ genLVal theoffset = "    mov     rax, rbp":("  sub rax, " ++ show theoffset):"  
 symbol :: Parser Char
 symbol = oneOf "+-*/"
 
-mainParser, parseStmt, parseExpr, parseAssign, parseEquality, parseRelational, parseMul, parseAdd, parseUnary, parseTerm, parseNum
-  :: Parser CTree
+mainParser :: Parser CTree
+mainParser =  spaces >> (Branch <$> parseStatements empty)
+  where
+    parseStatements :: Locals -> Parser [CTree]
+    parseStatements locals = do
+      (l, stmt) <- parseStmt locals
+      stmts <- spaces >> option [] (P.try $ parseStatements l)
+      return $ stmt:stmts
 
-mainParser = Branch <$> (spaces >>
-                          ((P.try $ do { eof; return $ [Leaf EOF]})
-                            <|> many parseStmt))
+parseStmt, parseExpr, parseAssign, parseEquality, parseRelational, parseMul, parseAdd, parseUnary, parseTerm, parseNum
+  :: Locals -> Parser (Locals, CTree)
 
-parseStmt = do
-  expr <- spaces >> parseExpr
-  _ <- spaces >> char ';'
+parseStmt l = do
+  expr <- spaces >> parseExpr l
+  _    <- spaces >> char ';'
   return expr
 
-parseExpr = parseAssign
+parseExpr l = (P.try $ parseAssign l)
+              <|> parseEquality l
 
-parseAssign = do
-  inits <- many (P.try $ do
-                   ident <- parseAssignLVar
-                   _  <- spaces >> string "="
-                   return $ ident)
-  expr <- spaces >> parseEquality
-  return . Branch $ expr:inits
+parseAssign l = do
+  (lx, inits) <- option (l, []) (P.try $ spaces >> parseinits l)
+  (ly, expr)  <- spaces >> parseEquality lx
+  return $ (ly, Branch $ expr:inits)
   where
-    parseAssignLVar = parseLVar True
+    parseAssignLVar lx = parseLVar lx True
+    parseinits locals = do
+      (lx, stmt)  <- spaces >> parseAssignLVar locals
+      _           <- spaces >> (char '=' >> (notFollowedBy $ char '='))
+      (ly, stmts) <- option (lx, []) (P.try $ spaces >> parseinits lx)
+      return $ (ly, stmt:stmts)
 
-parseEquality = do
-  rel0 <- parseRelational
-  rest <- many (P.try $ do
-                   eq <- spaces >> matchReserved <$> ((P.try $ string "==") <|> string "!=")
-                   rel <- spaces >> parseRelational
-                   return $ rel:[eq])
-  return . Branch $ rel0:(May.maybe ([]) (id) $ Safe.foldl1May (++) rest)
+parseEquality l = do
+  (lx, rel0) <- parseRelational l
+  (ly, rest) <- option (lx, []) (P.try $ parserest lx)
+  return (ly, Branch $ rel0:rest)
+  where
+    parserest locals = do
+      eq         <- spaces >> matchReserved <$> ((P.try $ string "==")
+                                                 <|> string "!=")
+      (lx, rel)  <- spaces >> parseRelational locals
+      (ly, rest) <- option (lx, []) $ P.try $ spaces >> parserest lx
+      return $ (ly, rel:eq:rest)
 
-parseRelational = do
-  add0 <- parseAdd
-  rest <- many (P.try $ do
-                   comp <- spaces >> matchReserved <$> ((P.try $ string "<=")
-                                                         <|> (P.try $ string ">=")
-                                                         <|> (P.try $ string ">")
-                                                         <|> string "<")
-                   add <- spaces >> parseAdd
-                   return $ add:[comp])
-  return . Branch $ add0:(May.maybe ([]) (id) $ Safe.foldl1May (++) rest)
+parseRelational l = do
+  (lx, add0) <- parseAdd l
+  (ly, rest) <- option (lx, []) (P.try $ parserest lx)
+  return (ly, Branch $ add0:rest)
+  where
+    parserest locals = do
+      comp <- spaces >> matchReserved <$> ((P.try $ string "<=")
+                                            <|> (P.try $ string ">=")
+                                            <|> (P.try $ string ">")
+                                            <|> string "<")
+      (lx, add)  <- spaces >> parseAdd locals
+      (ly, rest) <- option (lx, []) $ P.try $ spaces >> parserest lx
+      return $ (ly, add:comp:rest)
 
-parseAdd = do
-  mul0 <- parseMul
-  rest <- many (P.try $ do
-                   arthmetic <- spaces >> matchReserved <$> many1 (oneOf "+-")
-                   mul <- spaces >> parseMul
-                   return $ mul:[arthmetic])
-  return . Branch $ mul0:(May.maybe ([]) (id) $ Safe.foldl1May (++) rest)
+parseAdd l = do
+  (lx, mul0) <- parseMul l
+  (ly, rest) <- option (lx, []) $ P.try $ parserest lx
+  return (ly, Branch $ mul0:rest)
+  where
+    parserest locals = do
+      arthmetic  <- spaces >> matchReserved <$> many1 (oneOf "+-")
+      (lx, mul)  <- spaces >> parseMul locals
+      (ly, rest) <- option (lx, []) $ P.try $ spaces >> parserest lx
+      return $ (ly, mul:arthmetic:rest)
 
-parseMul = do
-  una0 <- parseUnary
-  rest <- many (P.try $ do
-                   arthmetic <- spaces >> matchReserved <$> many1 (oneOf "*/")
-                   una <- spaces >> parseUnary
-                   return $ una:[arthmetic])
-  return . Branch $ una0:(May.maybe ([]) (id) $ Safe.foldl1May (++) rest)
+parseMul l = do
+  (lx, una0) <- parseUnary l
+  (ly, rest) <- option (lx, []) $ P.try $ parserest lx
+  return (ly, Branch $ una0:rest)
+  where
+    parserest locals = do
+      arthmetic <- spaces >> matchReserved <$> many1 (oneOf "*/")
+      (lx, una)  <- spaces >> parseUnary locals
+      (ly, rest) <- option (lx, []) $ P.try $ spaces >> parserest lx
+      return $ (ly, una:arthmetic:rest)
 
-parseUnary = do
-  op <- (P.try $ oneOf "+-") <|> (P.try $ lookAhead anyToken)
-  spaces
-  num <- parseTerm
+parseUnary l = do
+  op        <- (P.try $ oneOf "+-") <|> (P.try $ lookAhead anyToken)
+  (lx, num) <- spaces >> parseTerm l
   return $ case op of
-             '-' -> Branch [(Leaf . CInt) 0, num, Leaf . CReserved $ Sub]
-             '+' -> num
-             _   -> num
+             '-' -> (lx , Branch [(Leaf . CInt) 0, num, Leaf . CReserved $ Sub])
+             '+' -> (lx, num)
+             _   -> (lx, num)
 
-parseTerm = P.try parseNum
-            <|> (P.try $ parseLVar False)
-            <|> (P.try $ between (char '(') (char ')') parseExpr)
+parseTerm l = P.try $ parseNum l
+            <|> (P.try $ parseLVar l False)
+            <|> (P.try $ between (char '(') (char ')') $ parseExpr l)
 
-parseNum = Leaf . CInt . read <$> many1 digit
+parseNum l = do
+  ctree <- Leaf . CInt . read <$> many1 digit
+  return (l, ctree)
 
-parseLVar :: Bool -> Parser CTree
-parseLVar isassn = do
-  var <- letter
-  return . Leaf $ LVar { offset = fromIntegral $ 8 * (1 + (length (takeWhile (var /=) ['a'..'z'])))
-                       , isassign = isassn}
+parseLVar :: Locals -> Bool -> Parser (Locals, CTree)
+parseLVar locals isassn = do
+  var <- many1 letter
+  let
+    theoffset = 8 + (Safe.maximumDef 0 (elems locals))
+    lvar = maybe
+           (Leaf $ LVar { offset = theoffset , isassign = isassn})
+           (\x -> Leaf $ LVar { offset = x , isassign = isassn} )
+           $ locals !? var
+    in
+    return (Map.insert var theoffset locals, lvar)
+  -- return . Leaf $ LVar { offset = fromIntegral $ 8 * (1 + (length (takeWhile (var /=) ['a'..'z'])))
+  --                      , isassign = isassn}
   -- (Leaf . Ident) var
   -- Branch [Leaf . CReserved . LVar $ 8 * (1 + (length (takeWhile (var /=) ['a'..'z']))), Leaf . CReserved $ Ident]
 
@@ -200,41 +234,41 @@ matchReserved x =
       _    -> Unknown
 
 
-codeGen :: CTree -> IO ()
-codeGen val =
-      mapM_ putStrLn
-        $ code ++
-        "":
-        "; epiloge":
-        "":
-        "    pop     rax":
-        "    mov     rbx, rax":
-        "    mov     rsp, rbp":
-        "    pop     rbp":
-        "    ret":
-        "":
-        "":[]
-        where code = (makeSrc ( "section .text"
-                              : "global _start"
-                              : ""
-                              : "_start:"
-                              : "    call    main"
-                              : ""
-                              : "_exit:"
-                              : "    mov     rax, 1"
-                              -- : "    pop     rbx"
-                              : "    int     0x80"
-                              : ""
-                              : "main:"
-                              : "; prologe"
-                              : ""
-                              : "    push    rbp"
-                              : "    mov     rbp, rsp"
-                              : "    sub     rsp, 208"
-                              : ""
-                              : ""
-                              : "; generated code"
-                              : "":[]) val)
+-- codeGen :: CTree -> IO ()
+-- codeGen val =
+--       mapM_ putStrLn
+--         $ code ++
+--         "":
+--         "; epiloge":
+--         "":
+--         "    pop     rax":
+--         "    mov     rbx, rax":
+--         "    mov     rsp, rbp":
+--         "    pop     rbp":
+--         "    ret":
+--         "":
+--         "":[]
+--         where code = (makeSrc ( "section .text"
+--                               : "global _start"
+--                               : ""
+--                               : "_start:"
+--                               : "    call    main"
+--                               : ""
+--                               : "_exit:"
+--                               : "    mov     rax, 1"
+--                               -- : "    pop     rbx"
+--                               : "    int     0x80"
+--                               : ""
+--                               : "main:"
+--                               : "; prologe"
+--                               : ""
+--                               : "    push    rbp"
+--                               : "    mov     rbp, rsp"
+--                               : "    sub     rsp, 208"
+--                               : ""
+--                               : ""
+--                               : "; generated code"
+--                               : "":[]) val)
 
 
 main :: IO ()
@@ -242,6 +276,14 @@ main = do
   input <- head <$> Env.getArgs
   case parse mainParser "" input of
     Right val -> do
-      -- putStr . TLazy.unpack . PrettyS.pShow $ val
-      codeGen val
+      putStr . TLazy.unpack . PrettyS.pShow $ val
+      -- codeGen val
+    Left err  -> putStrLn $ show err
+
+debugmain :: String -> IO ()
+debugmain input =
+    case parse mainParser "" input of
+    Right val -> do
+      putStr . TLazy.unpack . PrettyS.pShow $ val
+      -- codeGen val
     Left err  -> putStrLn $ show err
