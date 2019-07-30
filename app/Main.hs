@@ -25,7 +25,8 @@ data CLeaf = CReserved Reserved
            | CInt      Int
            | LVar { offset   :: Offset
                   , isassign :: Bool}
-           | Funcall {funcName :: String}
+           | Funcall { funcName :: String
+                     , args     :: [CTree]}
            | EOF
            deriving  (Show, Eq)
 
@@ -63,31 +64,41 @@ data CTree = Branch [CTree]
            deriving (Show, Eq)
 
 mainParser :: Parser (Integer, Locals, CTree)
-mainParser =  spaces >> (parseStatements 0 empty)
-  where
-    parseStatements :: Integer -> Locals -> Parser (Integer, Locals, CTree)
-    parseStatements num locals = do
-      (num0, l0, stmt) <- parseStmt (num + 1) locals
-      (num1, l1, stmts) <- spaces >> option (num0, l0, Leaf EOF) (P.try $ parseStatements (num0 + 1) l0)
-      return $ (num1, l1, Branch $ stmt:stmts:[])
+mainParser = parseProgram
+
+parseProgram :: Parser (Integer, Locals, CTree)
+parseProgram =  spaces >> (parseStatements 0 empty)
+
+parseStatements :: Integer -> Locals -> Parser (Integer, Locals, CTree)
+parseStatements num locals = do
+  (num0, l0, stmt) <- spaces >> parseStmt (num + 1) locals
+  (num1, l1, stmts) <- spaces >> option (num0, l0, Leaf EOF) (P.try $ parseStatements (num0 + 1) l0)
+  return $ (num1, l1, Branch $ stmt:stmts:[])
 
 parseExpr, parseAssign, parseEquality, parseRelational, parseMul, parseAdd, parseUnary, parseTerm, parseNum, parseFuncall
   :: Locals -> Parser (Locals, CTree)
 
 parseStmt :: Integer -> Locals -> Parser (Integer, Locals, CTree)
 parseStmt num l =
-  (P.try $ simplestmt num l)
+  (P.try $ blockstmt num l)
   <|> (P.try $ ifstmt num l)
   <|> (P.try $ whilestmt num l)
   <|> (P.try $ forstmt num l)
   <|> (P.try $ returnstmt num l)
+  <|> simplestmt num l
 
-simplestmt, ifstmt, whilestmt, forstmt, returnstmt :: Integer -> Locals -> Parser (Integer, Locals, CTree)
+simplestmt, blockstmt, ifstmt, whilestmt, forstmt, returnstmt :: Integer -> Locals -> Parser (Integer, Locals, CTree)
 
 simplestmt num l = do
   expr <- spaces >> parseExpr l
   _    <- spaces >> char ';'
   return $ (\(l0, ctree) -> (num, l0, ctree)) expr
+
+blockstmt num l = do
+  _ <- spaces >> char '{'
+  stmts <- parseStatements num l
+  _ <- spaces >> char '}'
+  return stmts
 
 ifstmt num l = do
   _                <- spaces >> string "if"
@@ -110,7 +121,7 @@ ifstmt num l = do
         (numx0, lx0, stmt) <- spaces >> parseStmt numx lx
         return (numx0, lx0, stmt)
 
-whilestmt num l = do
+forstmt num l = do
   _                <- spaces >> spaces >> string "for"
   _                <- spaces >> char '('
   (l0, initialize) <- spaces >> option (l, Branch []) (P.try $ parseExpr l)
@@ -130,8 +141,8 @@ whilestmt num l = do
            : theproc
            : (Leaf . CtrlStruct $ For {cond = End, nthLabel = num}):[])
 
-forstmt num l = do
-  _                <- spaces >> spaces >> string "for"
+whilestmt num l = do
+  _                <- spaces >> spaces >> string "while"
   _                <- spaces >> char '('
   (l0, thecond)    <- spaces >> parseExpr l
   _                <- spaces >> char ')'
@@ -232,8 +243,16 @@ parseNum l = do
 parseFuncall l = do
   func <- many1 letter
   _ <- spaces >> char '('
+  (l0, fstarg) <- option (l, Branch []) (P.try $ spaces >> parseExpr l)
+  (l1, restargs) <- getArgs l0
   _ <- spaces >> char ')'
-  return (l, Leaf Funcall {funcName = func})
+  return (l1, Leaf Funcall {funcName = func, args = fstarg:restargs})
+  where
+    getArgs lx = do
+      _           <- spaces >> char ','
+      (lx0, xfst) <- option (lx, Branch []) (P.try $ spaces >> parseExpr lx)
+      (lx1, rest) <- option (lx, []) (P.try $ spaces >> getArgs lx0)
+      return $ (lx1, xfst:rest)
 
 parseLVar :: Locals -> Bool -> Parser (Locals, CTree)
 parseLVar locals isassn = do
@@ -308,7 +327,10 @@ makeSrc accm (Leaf (CtrlStruct ctrl)) = accm ++ generated
   where
     generated = matchCtrlStruct ctrl
 makeSrc accm (Leaf (CInt num)) = accm ++ push num
-makeSrc accm (Leaf (Funcall func)) = ("extern    " ++ func):accm ++ ("    call    " ++ func):[]
+makeSrc accm (Leaf (Funcall {funcName = func, args = theargs})) =
+  ("extern    " ++ func):accm ++ ("    call    " ++ func):[]
+  -- where
+  --   generated = callFunc func theargs
 makeSrc accm (Leaf (LVar theoffset True)) = accm ++ generated
   where
     generated = stackAssign theoffset
@@ -382,6 +404,9 @@ stackLoadLval theoffset =
 
 genLVal :: Integer -> [String]
 genLVal theoffset = "    mov     rax, rbp":("    sub     rax, " ++ show theoffset):"    push    rax":[]
+
+-- callFunc :: String -> [CTree] -> [String]
+-- callFunc =
 
 main :: IO ()
 main = do
