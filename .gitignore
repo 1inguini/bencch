@@ -5,3 +5,4 @@ bencch.cabal
 #*#
 tmp
 tmp.*
+*.o

@@ -25,6 +25,7 @@ data CLeaf = CReserved Reserved
            | CInt      Int
            | LVar { offset   :: Offset
                   , isassign :: Bool}
+           | Funcall {funcName :: String}
            | EOF
            deriving  (Show, Eq)
 
@@ -70,7 +71,7 @@ mainParser =  spaces >> (parseStatements 0 empty)
       (num1, l1, stmts) <- spaces >> option (num0, l0, Leaf EOF) (P.try $ parseStatements (num0 + 1) l0)
       return $ (num1, l1, Branch $ stmt:stmts:[])
 
-parseExpr, parseAssign, parseEquality, parseRelational, parseMul, parseAdd, parseUnary, parseTerm, parseNum
+parseExpr, parseAssign, parseEquality, parseRelational, parseMul, parseAdd, parseUnary, parseTerm, parseNum, parseFuncall
   :: Locals -> Parser (Locals, CTree)
 
 parseStmt :: Integer -> Locals -> Parser (Integer, Locals, CTree)
@@ -220,12 +221,19 @@ parseUnary l = do
              _   -> (lx, num)
 
 parseTerm l = P.try $ parseNum l
-            <|> (P.try $ parseLVar l False)
-            <|> (P.try $ between (char '(') (char ')') $ parseExpr l)
+              <|> (P.try $ parseFuncall l)
+              <|> (P.try $ parseLVar l False)
+              <|> (P.try $ between (char '(') (char ')') $ parseExpr l)
 
 parseNum l = do
   ctree <- Leaf . CInt . read <$> many1 digit
   return (l, ctree)
+
+parseFuncall l = do
+  func <- many1 letter
+  _ <- spaces >> char '('
+  _ <- spaces >> char ')'
+  return (l, Leaf Funcall {funcName = func})
 
 parseLVar :: Locals -> Bool -> Parser (Locals, CTree)
 parseLVar locals isassn = do
@@ -300,6 +308,7 @@ makeSrc accm (Leaf (CtrlStruct ctrl)) = accm ++ generated
   where
     generated = matchCtrlStruct ctrl
 makeSrc accm (Leaf (CInt num)) = accm ++ push num
+makeSrc accm (Leaf (Funcall func)) = ("extern    " ++ func):accm ++ ("    call    " ++ func):[]
 makeSrc accm (Leaf (LVar theoffset True)) = accm ++ generated
   where
     generated = stackAssign theoffset
