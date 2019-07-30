@@ -24,6 +24,7 @@ data CLeaf = CReserved Reserved
            | CInt      Int
            | LVar { offset   :: Offset
                   , isassign :: Bool}
+           | Return
            | EOF
            deriving Show
 
@@ -49,62 +50,6 @@ data CTree = Branch [CTree]
            | Leaf   CLeaf
            deriving Show
 
-makeSrc :: [String] -> CTree -> [String]
-makeSrc accm (Branch []) = accm
-makeSrc accm (Branch (tree:treeList)) =
-  makeSrc generated $ Branch treeList
-  where
-    generated = makeSrc accm tree
-makeSrc accm (Leaf (CReserved func)) = accm ++ generated
-  where
-    generated = stackExec (matchLLVMCommand $ func)
-makeSrc accm (Leaf (CInt num)) = accm ++ push num
-makeSrc accm (Leaf (LVar theoffset True)) = accm ++ generated
-  where
-    generated = stackAssign theoffset
-makeSrc accm (Leaf (LVar theoffset False)) = accm ++ generated
-  where
-    generated = stackLoadLval theoffset
-makeSrc accm (Leaf EOF) = accm
-
-matchLLVMCommand :: Reserved -> [String]
-matchLLVMCommand func =
-  case func of
-    Add -> "    add     rax, rdi":[]
-    Sub -> "    sub     rax, rdi":[]
-    Mul -> "    imul    rdi"     :[]
-    Div -> "    idiv    rdi"     :[]
-    Eq  -> "    cmp     rax, rdi":"    sete    al" :"    movzx   rax, al":[]
-    NEq -> "    cmp     rax, rdi":"    setne   al" :"    movzx   rax, al":[]
-    GrT -> "    cmp     rdi, rax":"    setl    al" :"    movzx   rax, al":[]
-    GrE -> "    cmp     rdi, rax":"    setle   al" :"    movzx   rax, al":[]
-    LsT -> "    cmp     rax, rdi":"    setl    al" :"    movzx   rax, al":[]
-    LsE -> "    cmp     rax, rdi":"    setle   al" :"    movzx   rax, al":[]
-
-push :: Int -> [String]
-push num =
-  ("    push    " ++ show num):"":[]
-
-stackExec :: [String] -> [String]
-stackExec func =
-  "    pop     rdi":"    pop     rax":func ++ "    push    rax":"":[]
-
-stackAssign :: Integer -> [String]
-stackAssign theoffset =
-  (genLVal theoffset) ++
-  "    pop     rdi":"    pop     rax":"    mov     [rdi], rax":"":[]
-
-stackLoadLval :: Integer -> [String]
-stackLoadLval theoffset =
-  (genLVal theoffset) ++
-  "    pop     rax":"    mov     rax, [rax]":"    push    rax":[]
-
-genLVal :: Integer -> [String]
-genLVal theoffset = "    mov     rax, rbp":("    sub     rax, " ++ show theoffset):"    push    rax":[]
-
-symbol :: Parser Char
-symbol = oneOf "+-*/"
-
 mainParser :: Parser (Locals, CTree)
 mainParser =  spaces >> (parseStatements empty)
   where
@@ -117,13 +62,16 @@ mainParser =  spaces >> (parseStatements empty)
 parseStmt, parseExpr, parseAssign, parseEquality, parseRelational, parseMul, parseAdd, parseUnary, parseTerm, parseNum
   :: Locals -> Parser (Locals, CTree)
 
-parseStmt l = do
-  expr <- spaces >> parseExpr l
-  _    <- spaces >> char ';'
-  return expr
+parseStmt l =
+  (P.try $ do{ expr <- spaces >> parseExpr l
+             ; _    <- spaces >> char ';'
+             ; return expr})
+  <|> do{ _    <- spaces >> string "return"
+        ; (lx, expr) <- spaces >> parseExpr l
+        ; _    <- spaces >> char ';'
+        ; return (lx, Branch $ expr:(Leaf Return):[])}
 
-parseExpr l = (P.try $ parseAssign l)
-              <|> parseEquality l
+parseExpr l = parseAssign l
 
 parseAssign l = do
   (lx, inits) <- option (l, []) (P.try $ spaces >> parseinits l)
@@ -237,17 +185,7 @@ matchReserved x =
 codeGen :: Locals -> CTree -> IO ()
 codeGen locals val =
       mapM_ putStrLn
-        $ code ++
-        "":
-        "; epiloge":
-        "":
-        "    pop     rax":
-        "    mov     rbx, rax":
-        "    mov     rsp, rbp":
-        "    pop     rbp":
-        "    ret":
-        "":
-        "":[]
+        $ code
         where code = (makeSrc ( "section .text"
                               : "global _start"
                               : ""
@@ -270,13 +208,75 @@ codeGen locals val =
                               : "; generated code"
                               : "":[]) val)
 
+makeSrc :: [String] -> CTree -> [String]
+makeSrc accm (Branch []) = accm
+makeSrc accm (Branch (tree:treeList)) =
+  makeSrc generated $ Branch treeList
+  where
+    generated = makeSrc accm tree
+makeSrc accm (Leaf (CReserved func)) = accm ++ generated
+  where
+    generated = stackExec (matchLLVMCommand $ func)
+makeSrc accm (Leaf (CInt num)) = accm ++ push num
+makeSrc accm (Leaf (LVar theoffset True)) = accm ++ generated
+  where
+    generated = stackAssign theoffset
+makeSrc accm (Leaf (LVar theoffset False)) = accm ++ generated
+  where
+    generated = stackLoadLval theoffset
+makeSrc accm (Leaf Return) = accm ++ generated
+  where
+    generated =
+      "; epiloge":
+      "":
+      "    pop     rax":
+      "    mov     rbx, rax":
+      "    mov     rsp, rbp":
+      "    pop     rbp":
+      "    ret":"":[]
+makeSrc accm (Leaf EOF) = accm
+
+matchLLVMCommand :: Reserved -> [String]
+matchLLVMCommand func =
+  case func of
+    Add -> "    add     rax, rdi":[]
+    Sub -> "    sub     rax, rdi":[]
+    Mul -> "    imul    rdi"     :[]
+    Div -> "    idiv    rdi"     :[]
+    Eq  -> "    cmp     rax, rdi":"    sete    al" :"    movzx   rax, al":[]
+    NEq -> "    cmp     rax, rdi":"    setne   al" :"    movzx   rax, al":[]
+    GrT -> "    cmp     rdi, rax":"    setl    al" :"    movzx   rax, al":[]
+    GrE -> "    cmp     rdi, rax":"    setle   al" :"    movzx   rax, al":[]
+    LsT -> "    cmp     rax, rdi":"    setl    al" :"    movzx   rax, al":[]
+    LsE -> "    cmp     rax, rdi":"    setle   al" :"    movzx   rax, al":[]
+
+push :: Int -> [String]
+push num =
+  ("    push    " ++ show num):"":[]
+
+stackExec :: [String] -> [String]
+stackExec func =
+  "    pop     rdi":"    pop     rax":func ++ "    push    rax":"":[]
+
+stackAssign :: Integer -> [String]
+stackAssign theoffset =
+  (genLVal theoffset) ++
+  "    pop     rdi":"    pop     rax":"    mov     [rdi], rax":"":[]
+
+stackLoadLval :: Integer -> [String]
+stackLoadLval theoffset =
+  (genLVal theoffset) ++
+  "    pop     rax":"    mov     rax, [rax]":"    push    rax":"":[]
+
+genLVal :: Integer -> [String]
+genLVal theoffset = "    mov     rax, rbp":("    sub     rax, " ++ show theoffset):"    push    rax":[]
 
 main :: IO ()
 main = do
   input <- head <$> Env.getArgs
   case parse mainParser "" input of
     Right (l, val) -> do
-      -- putStr . TLazy.unpack . PrettyS.pShow $ val
+      -- putStrLn . TLazy.unpack . PrettyS.pShow $ val
       codeGen l val
     Left err  -> putStrLn $ show err
 
