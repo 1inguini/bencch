@@ -34,6 +34,6 @@ try "$((100-3*+5))" "return 100-3*+5;"
  
 try 12 "a=12;return a;"
 
-try "$(echo define main\(\) {$1} main\(\) | bc)" "$1"
+try "$(echo define main\(\) { $1 } main\(\) | bc)" "$1"
 
 echo OK

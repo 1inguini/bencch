@@ -5,7 +5,7 @@ module Main where
 -- import qualified Data.List                     as List
 -- import           Data.Map.Strict               ((!?))
 import           Data.Map.Strict               as Map
-import qualified Data.Maybe                    as May
+-- import qualified Data.Maybe                    as May
 -- import qualified Data.Text.Lazy                as TLazy
 -- import qualified System.Console.Haskeline      as HLine
 -- import qualified System.Environment            as Env
@@ -21,17 +21,28 @@ import           Text.ParserCombinators.Parsec
 import qualified Text.Pretty.Simple            as PrettyS
 
 data CLeaf = CReserved Reserved
+           | CtrlStruct CtrlStruct
            | CInt      Int
            | LVar { offset   :: Offset
                   , isassign :: Bool}
-           | Return
            | EOF
-           deriving Show
+           deriving  (Show, Eq)
 
 type VarName = String
 type Offset = Integer
 
 type Locals = Map VarName Offset
+
+data CtrlCond = Start
+              | Mid
+              | End
+              deriving (Show, Eq)
+
+data CtrlStruct = If   { cond :: CtrlCond, nthLabel :: Integer}
+                | Whl  { cond :: CtrlCond, nthLabel :: Integer}
+                | For  { cond :: CtrlCond, nthLabel :: Integer}
+                | Ret
+                deriving (Show, Eq)
 
 data Reserved = Add
               | Sub
@@ -44,32 +55,99 @@ data Reserved = Add
               | LsT
               | LsE
               | Unknown
-              deriving Show
+              deriving (Show, Eq)
 
 data CTree = Branch [CTree]
            | Leaf   CLeaf
-           deriving Show
+           deriving (Show, Eq)
 
-mainParser :: Parser (Locals, CTree)
-mainParser =  spaces >> (parseStatements empty)
+mainParser :: Parser (Integer, Locals, CTree)
+mainParser =  spaces >> (parseStatements 0 empty)
   where
-    parseStatements :: Locals -> Parser (Locals, CTree)
-    parseStatements locals = do
-      (l0, stmt) <- parseStmt locals
-      (l1, stmts) <- spaces >> option (l0, Leaf EOF) (P.try $ parseStatements l0)
-      return $ (l1, Branch $ stmt:stmts:[])
+    parseStatements :: Integer -> Locals -> Parser (Integer, Locals, CTree)
+    parseStatements num locals = do
+      (num0, l0, stmt) <- parseStmt (num + 1) locals
+      (num1, l1, stmts) <- spaces >> option (num0, l0, Leaf EOF) (P.try $ parseStatements (num0 + 1) l0)
+      return $ (num1, l1, Branch $ stmt:stmts:[])
 
-parseStmt, parseExpr, parseAssign, parseEquality, parseRelational, parseMul, parseAdd, parseUnary, parseTerm, parseNum
+parseExpr, parseAssign, parseEquality, parseRelational, parseMul, parseAdd, parseUnary, parseTerm, parseNum
   :: Locals -> Parser (Locals, CTree)
 
-parseStmt l =
-  (P.try $ do{ expr <- spaces >> parseExpr l
-             ; _    <- spaces >> char ';'
-             ; return expr})
-  <|> do{ _    <- spaces >> string "return"
-        ; (lx, expr) <- spaces >> parseExpr l
-        ; _    <- spaces >> char ';'
-        ; return (lx, Branch $ expr:(Leaf Return):[])}
+parseStmt :: Integer -> Locals -> Parser (Integer, Locals, CTree)
+parseStmt num l =
+  (P.try $ simplestmt num l)
+  <|> (P.try $ ifstmt num l)
+  <|> (P.try $ whilestmt num l)
+  <|> (P.try $ forstmt num l)
+  <|> (P.try $ returnstmt num l)
+
+simplestmt, ifstmt, whilestmt, forstmt, returnstmt :: Integer -> Locals -> Parser (Integer, Locals, CTree)
+
+simplestmt num l = do
+  expr <- spaces >> parseExpr l
+  _    <- spaces >> char ';'
+  return $ (\(l0, ctree) -> (num, l0, ctree)) expr
+
+ifstmt num l = do
+  _                <- spaces >> string "if"
+  _                <- spaces >> char '('
+  (l0, thecond)    <- spaces >> parseExpr l
+  _                <- spaces >> char ')'
+  (num0, l1, stmt) <- spaces >> parseStmt num l0
+  (num1, l2, elst) <- option (num0, l1, Branch []) (P.try $ elsestmt num0 l1)
+  return (num1, l2
+         , Branch
+         $ thecond
+         :(Leaf . CtrlStruct $ If {cond = Start, nthLabel = num})
+         :stmt
+         :(Leaf . CtrlStruct $ If {cond = Mid, nthLabel = num})
+         :elst
+         :(Leaf . CtrlStruct $ If {cond = End, nthLabel = num}):[])
+    where
+      elsestmt numx lx = do
+        _ <- spaces >> string "else"
+        (numx0, lx0, stmt) <- spaces >> parseStmt numx lx
+        return (numx0, lx0, stmt)
+
+whilestmt num l = do
+  _                <- spaces >> spaces >> string "for"
+  _                <- spaces >> char '('
+  (l0, initialize) <- spaces >> option (l, Branch []) (P.try $ parseExpr l)
+  _                <- spaces >> char ';'
+  (l1, thecond)    <- spaces >> option (l, Branch []) (P.try $ parseExpr l0)
+  _                <- spaces >> char ';'
+  (l2, theproc)    <- spaces >> option (l, Branch []) (P.try $ parseExpr l1)
+  _                <- spaces >> char ')'
+  (num0, l3, stmt) <- spaces >> parseStmt num l2
+  return (num0, l3
+         , Branch
+           $ initialize
+           : (Leaf . CtrlStruct $ For {cond = Start, nthLabel = num})
+           : thecond
+           : (Leaf . CtrlStruct $ For {cond = Mid, nthLabel = num})
+           : stmt
+           : theproc
+           : (Leaf . CtrlStruct $ For {cond = End, nthLabel = num}):[])
+
+forstmt num l = do
+  _                <- spaces >> spaces >> string "for"
+  _                <- spaces >> char '('
+  (l0, thecond)    <- spaces >> parseExpr l
+  _                <- spaces >> char ')'
+  (num0, l1, stmt) <- spaces >> parseStmt num l0
+  return (num0, l1
+         , Branch
+           $ (Leaf . CtrlStruct $ Whl {cond = Start, nthLabel = num})
+           :thecond
+           :(Leaf . CtrlStruct $ Whl {cond = Mid, nthLabel = num})
+           :stmt
+           :(Leaf . CtrlStruct $ Whl {cond = End, nthLabel = num}):[])
+
+returnstmt num l = do
+  _                <- spaces >> string "return"
+  (num0, l0, expr) <- spaces >> simplestmt num l
+  return (num0, l0, Branch $ expr:(Leaf . CtrlStruct $ Ret):[])
+
 
 parseExpr l = parseAssign l
 
@@ -153,13 +231,15 @@ parseLVar :: Locals -> Bool -> Parser (Locals, CTree)
 parseLVar locals isassn = do
   var <- many1 letter
   let
-    theoffset = 8 + (Safe.maximumDef 0 (elems locals))
-    lvar = maybe
-           (Leaf $ LVar { offset = theoffset , isassign = isassn})
-           (\x -> Leaf $ LVar { offset = x , isassign = isassn} )
-           $ locals !? var
+    theoffset = if isassn
+                then 8 + (Safe.maximumDef 0 (elems locals))
+                else (Safe.maximumDef 0 (elems locals))
+    (l, lvar) = maybe
+                (Map.insert var theoffset locals, Leaf $ LVar { offset = theoffset , isassign = isassn})
+                (\x -> (locals, Leaf $ LVar { offset = x , isassign = isassn}))
+                $ locals !? var
     in
-    return (Map.insert var theoffset locals, lvar)
+    return (l, lvar)
   -- return . Leaf $ LVar { offset = fromIntegral $ 8 * (1 + (length (takeWhile (var /=) ['a'..'z'])))
   --                      , isassign = isassn}
   -- (Leaf . Ident) var
@@ -180,7 +260,6 @@ matchReserved x =
       ">"  -> GrT
       ">=" -> GrE
       _    -> Unknown
-
 
 codeGen :: Locals -> CTree -> IO ()
 codeGen locals val =
@@ -216,7 +295,10 @@ makeSrc accm (Branch (tree:treeList)) =
     generated = makeSrc accm tree
 makeSrc accm (Leaf (CReserved func)) = accm ++ generated
   where
-    generated = stackExec (matchLLVMCommand $ func)
+    generated = stackExec (matchCommand $ func)
+makeSrc accm (Leaf (CtrlStruct ctrl)) = accm ++ generated
+  where
+    generated = matchCtrlStruct ctrl
 makeSrc accm (Leaf (CInt num)) = accm ++ push num
 makeSrc accm (Leaf (LVar theoffset True)) = accm ++ generated
   where
@@ -224,20 +306,10 @@ makeSrc accm (Leaf (LVar theoffset True)) = accm ++ generated
 makeSrc accm (Leaf (LVar theoffset False)) = accm ++ generated
   where
     generated = stackLoadLval theoffset
-makeSrc accm (Leaf Return) = accm ++ generated
-  where
-    generated =
-      "; epiloge":
-      "":
-      "    pop     rax":
-      "    mov     rbx, rax":
-      "    mov     rsp, rbp":
-      "    pop     rbp":
-      "    ret":"":[]
 makeSrc accm (Leaf EOF) = accm
 
-matchLLVMCommand :: Reserved -> [String]
-matchLLVMCommand func =
+matchCommand :: Reserved -> [String]
+matchCommand func =
   case func of
     Add -> "    add     rax, rdi":[]
     Sub -> "    sub     rax, rdi":[]
@@ -249,6 +321,37 @@ matchLLVMCommand func =
     GrE -> "    cmp     rdi, rax":"    setle   al" :"    movzx   rax, al":[]
     LsT -> "    cmp     rax, rdi":"    setl    al" :"    movzx   rax, al":[]
     LsE -> "    cmp     rax, rdi":"    setle   al" :"    movzx   rax, al":[]
+    Unknown -> []
+
+matchCtrlStruct :: CtrlStruct -> [String]
+matchCtrlStruct ctrl =
+  case ctrl of
+    If {cond = Start, nthLabel = lnum}  -> "    pop     rax":
+                                           "    cmp     rax, 0":
+                                           ("    je      Lelse" ++ show lnum):"":[]
+    If {cond = Mid, nthLabel = lnum}    -> ("    jmp     Lend" ++ show lnum):("Lelse" ++ show lnum ++ ":"):[]
+    If {cond = End, nthLabel = lnum}    -> ("Lend" ++ show lnum ++ ":"):"":[]
+
+    Whl {cond = Start, nthLabel = lnum} -> ("Lbegin" ++ show lnum ++ ":"):[]
+    Whl {cond = Mid, nthLabel = lnum}   -> "    pop     rax":
+                                           "    cmp     rax, 0":
+                                           ("    je      Lend" ++ show lnum):"":[]
+    Whl {cond = End, nthLabel = lnum}   -> ("    jmp     Lbegin" ++ show lnum):("Lend" ++ show lnum ++ ":"):[]
+
+    For {cond = Start, nthLabel = lnum} -> ("Lbegin" ++ show lnum ++ ":"):[]
+    For {cond = Mid, nthLabel = lnum}   ->  "    pop     rax":
+                                            "    cmp     rax, 0":
+                                           ("    je      Lend" ++ show lnum):"":[]
+    For {cond = End, nthLabel = lnum}   -> ("    jmp     Lbegin" ++ show lnum):("Lend" ++ show lnum ++ ":"):[]
+
+    Ret -> "; epiloge":
+           "":
+           "    pop     rax":
+           "    mov     rbx, rax":
+           "    mov     rsp, rbp":
+           "    pop     rbp":
+           "    ret":"":[]
+
 
 push :: Int -> [String]
 push num =
@@ -275,7 +378,7 @@ main :: IO ()
 main = do
   input <- head <$> Env.getArgs
   case parse mainParser "" input of
-    Right (l, val) -> do
+    Right (_, l, val) -> do
       -- putStrLn . TLazy.unpack . PrettyS.pShow $ val
       codeGen l val
     Left err  -> putStrLn $ show err
