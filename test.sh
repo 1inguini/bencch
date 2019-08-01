@@ -3,6 +3,7 @@
 # set -Ceux
 
 execcode() {
+    clang -c $(ls ./*.c)
     stack run -- "$1" > tmp.asm
     nasm -o tmp.o -felf64 tmp.asm
     cc -nostartfiles -no-pie -o tmp $(ls ./*.o)
@@ -40,7 +41,7 @@ try() {
 
 # try "$(echo define main\(\) { $1 } main\(\) | bc)" "$1"
 
-echo OK
+# echo OK
 
 execcode "$1"
 

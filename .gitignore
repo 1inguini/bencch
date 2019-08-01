@@ -1,8 +1,8 @@
 .stack-work/
 bencch.cabal
 *~
-#*.*#
-#*#
+\#*\#
 tmp
 tmp.*
 *.o
+.gdb_history

@@ -4,7 +4,7 @@ module Main where
 -- import qualified Data.Either                   as E
 -- import qualified Data.List                     as List
 -- import           Data.Map.Strict               ((!?))
-import           Data.Map.Strict               as Map
+import qualified Data.Map.Strict               as Map
 -- import qualified Data.Maybe                    as May
 -- import qualified Data.Text.Lazy                as TLazy
 -- import qualified System.Console.Haskeline      as HLine
@@ -20,31 +20,45 @@ import qualified Text.Parsec                   as P
 import           Text.ParserCombinators.Parsec
 import qualified Text.Pretty.Simple            as PrettyS
 
-data CLeaf = CReserved Reserved
+data CTree = Branch [CTree]
+           | Leaf   CLeaf
+           deriving (Show, Eq)
+
+-- showCTree :: CTree -> String
+-- showCTree (Branch (tree:trees)) = if Prelude.null trees
+--   then show tree
+--   else "(Branch " ++ (Safe.foldl1Def "" (\x y -> x ++ ", " ++ y )  $ Prelude.map show (tree:trees)) ++ ")"
+-- showCTree (Branch []) = ""
+-- showCTree (Leaf leaf)    = "(Leaf " ++ show leaf ++ ")"
+
+-- instance Show CTree where show = showCTree
+
+data CLeaf = CReserved  Reserved
            | CtrlStruct CtrlStruct
-           | CInt      Int
-           | LVar { offset   :: Offset
-                  , isassign :: Bool}
-           | Funcall { funcName :: String
-                     , args     :: [CTree]}
+           | Stmt       CTree
+           | CInt       Int
+           | LVar       { offset   :: Offset
+                        , isassign :: Bool}
+           | Funcall    { funcName :: String
+                        , args     :: [(Integer, CTree)]}
            | EOF
            deriving  (Show, Eq)
 
 type VarName = String
 type Offset = Integer
 
-type Locals = Map VarName Offset
-
-data CtrlCond = Start
-              | Mid
-              | End
-              deriving (Show, Eq)
+type Locals = Map.Map VarName Offset
 
 data CtrlStruct = If   { cond :: CtrlCond, nthLabel :: Integer}
                 | Whl  { cond :: CtrlCond, nthLabel :: Integer}
                 | For  { cond :: CtrlCond, nthLabel :: Integer}
                 | Ret
                 deriving (Show, Eq)
+
+data CtrlCond = Start
+              | Mid
+              | End
+              deriving (Show, Eq)
 
 data Reserved = Add
               | Sub
@@ -59,26 +73,30 @@ data Reserved = Add
               | Unknown
               deriving (Show, Eq)
 
-data CTree = Branch [CTree]
-           | Leaf   CLeaf
-           deriving (Show, Eq)
+data Parsed = Parsed { stnum :: Integer
+                     , lvars :: Locals
+                     , ctree :: CTree}
+            deriving (Show, Eq)
 
-mainParser :: Parser (Integer, Locals, CTree)
+mainParser :: Parser Parsed
 mainParser = parseProgram
 
-parseProgram :: Parser (Integer, Locals, CTree)
-parseProgram =  spaces >> (parseStatements 0 empty)
+parseProgram :: Parser Parsed
+parseProgram =  spaces >> (do
+                              stmts <- parseStatements 0 Map.empty
+                              return $ stmts -- {ctree = Leaf . Stmt $ (ctree stmts)}
+                          )
 
-parseStatements :: Integer -> Locals -> Parser (Integer, Locals, CTree)
+parseStatements :: Integer -> Locals -> Parser Parsed
 parseStatements num locals = do
-  (num0, l0, stmt) <- spaces >> parseStmt (num + 1) locals
-  (num1, l1, stmts) <- spaces >> option (num0, l0, Leaf EOF) (P.try $ parseStatements (num0 + 1) l0)
-  return $ (num1, l1, Branch $ stmt:stmts:[])
+  stmt  <- spaces >> parseStmt (num + 1) locals
+  stmts <- spaces >> option (stmt {ctree = Leaf EOF}) (P.try $ parseStatements ((stnum stmt) + 1) (lvars stmt))
+  return $ stmts {ctree = (Branch $ (ctree stmt):(ctree stmts):[])}
 
 parseExpr, parseAssign, parseEquality, parseRelational, parseMul, parseAdd, parseUnary, parseTerm, parseNum, parseFuncall
   :: Locals -> Parser (Locals, CTree)
 
-parseStmt :: Integer -> Locals -> Parser (Integer, Locals, CTree)
+parseStmt :: Integer -> Locals -> Parser Parsed
 parseStmt num l =
   (P.try $ blockstmt num l)
   <|> (P.try $ ifstmt num l)
@@ -87,39 +105,39 @@ parseStmt num l =
   <|> (P.try $ returnstmt num l)
   <|> simplestmt num l
 
-simplestmt, blockstmt, ifstmt, whilestmt, forstmt, returnstmt :: Integer -> Locals -> Parser (Integer, Locals, CTree)
+simplestmt, blockstmt, ifstmt, whilestmt, forstmt, returnstmt :: Integer -> Locals -> Parser Parsed
 
 simplestmt num l = do
   expr <- spaces >> parseExpr l
   _    <- spaces >> char ';'
-  return $ (\(l0, ctree) -> (num, l0, ctree)) expr
+  return $ (\(l0, tree) -> (Parsed num l0 (Leaf . Stmt $ tree))) expr
 
 blockstmt num l = do
   _ <- spaces >> char '{'
   stmts <- parseStatements num l
   _ <- spaces >> char '}'
-  return stmts
+  return $ stmts {lvars = l}
 
 ifstmt num l = do
   _                <- spaces >> string "if"
   _                <- spaces >> char '('
   (l0, thecond)    <- spaces >> parseExpr l
   _                <- spaces >> char ')'
-  (num0, l1, stmt) <- spaces >> parseStmt num l0
-  (num1, l2, elst) <- option (num0, l1, Branch []) (P.try $ elsestmt num0 l1)
-  return (num1, l2
-         , Branch
-         $ thecond
-         :(Leaf . CtrlStruct $ If {cond = Start, nthLabel = num})
-         :stmt
-         :(Leaf . CtrlStruct $ If {cond = Mid, nthLabel = num})
-         :elst
-         :(Leaf . CtrlStruct $ If {cond = End, nthLabel = num}):[])
+  stmt <- spaces >> parseStmt num l0
+  elst <- option stmt (P.try $ elsestmt (stnum stmt) (lvars stmt))
+  return $ stmt { ctree =
+                  Branch
+                  $ thecond
+                  :(Leaf . CtrlStruct $ If {cond = Start, nthLabel = num})
+                  :(ctree stmt)
+                  :(Leaf . CtrlStruct $ If {cond = Mid, nthLabel = num})
+                  :(ctree elst)
+                  :(Leaf . CtrlStruct $ If {cond = End, nthLabel = num}):[]}
     where
       elsestmt numx lx = do
         _ <- spaces >> string "else"
-        (numx0, lx0, stmt) <- spaces >> parseStmt numx lx
-        return (numx0, lx0, stmt)
+        stmt <- spaces >> parseStmt numx lx
+        return stmt
 
 forstmt num l = do
   _                <- spaces >> spaces >> string "for"
@@ -130,35 +148,34 @@ forstmt num l = do
   _                <- spaces >> char ';'
   (l2, theproc)    <- spaces >> option (l, Branch []) (P.try $ parseExpr l1)
   _                <- spaces >> char ')'
-  (num0, l3, stmt) <- spaces >> parseStmt num l2
-  return (num0, l3
-         , Branch
-           $ initialize
-           : (Leaf . CtrlStruct $ For {cond = Start, nthLabel = num})
-           : thecond
-           : (Leaf . CtrlStruct $ For {cond = Mid, nthLabel = num})
-           : stmt
-           : theproc
-           : (Leaf . CtrlStruct $ For {cond = End, nthLabel = num}):[])
+  stmt             <- spaces >> parseStmt num l2
+  return (stmt {ctree = Branch
+                $ initialize
+                : (Leaf . CtrlStruct $ For {cond = Start, nthLabel = num})
+                : thecond
+                : (Leaf . CtrlStruct $ For {cond = Mid, nthLabel = num})
+                : (ctree stmt)
+                : theproc
+                : (Leaf . CtrlStruct $ For {cond = End, nthLabel = num}):[]})
 
 whilestmt num l = do
   _                <- spaces >> spaces >> string "while"
   _                <- spaces >> char '('
   (l0, thecond)    <- spaces >> parseExpr l
   _                <- spaces >> char ')'
-  (num0, l1, stmt) <- spaces >> parseStmt num l0
-  return (num0, l1
-         , Branch
-           $ (Leaf . CtrlStruct $ Whl {cond = Start, nthLabel = num})
-           :thecond
-           :(Leaf . CtrlStruct $ Whl {cond = Mid, nthLabel = num})
-           :stmt
-           :(Leaf . CtrlStruct $ Whl {cond = End, nthLabel = num}):[])
+  stmt             <- spaces >> parseStmt num l0
+  return $ stmt {ctree =
+                 Branch
+                 $ (Leaf . CtrlStruct $ Whl {cond = Start, nthLabel = num})
+                  :thecond
+                 :(Leaf . CtrlStruct $ Whl {cond = Mid, nthLabel = num})
+                 :(ctree stmt)
+                 :(Leaf . CtrlStruct $ Whl {cond = End, nthLabel = num}):[]}
 
 returnstmt num l = do
-  _                <- spaces >> string "return"
-  (num0, l0, expr) <- spaces >> simplestmt num l
-  return (num0, l0, Branch $ expr:(Leaf . CtrlStruct $ Ret):[])
+  _          <- spaces >> string "return"
+  (l0, expr) <- spaces >> parseExpr l
+  return $ Parsed num l0 (Leaf . Stmt $ Branch $ expr:(Leaf . CtrlStruct $ Ret):[])
 
 
 parseExpr l = parseAssign l
@@ -166,7 +183,9 @@ parseExpr l = parseAssign l
 parseAssign l = do
   (lx, inits) <- option (l, []) (P.try $ spaces >> parseinits l)
   (ly, expr)  <- spaces >> parseEquality lx
-  return $ (ly, Branch $ expr:inits)
+  return $ (ly, if Prelude.null inits
+                then expr
+                else Branch $ expr:inits)
   where
     parseAssignLVar lx = parseLVar lx True
     parseinits locals = do
@@ -178,7 +197,9 @@ parseAssign l = do
 parseEquality l = do
   (lx, rel0) <- parseRelational l
   (ly, rest) <- option (lx, []) (P.try $ parserest lx)
-  return (ly, Branch $ rel0:rest)
+  return (ly, if Prelude.null rest
+              then rel0
+              else Branch $ rel0:rest)
   where
     parserest locals = do
       eq         <- spaces >> matchReserved <$> ((P.try $ string "==")
@@ -204,7 +225,9 @@ parseRelational l = do
 parseAdd l = do
   (lx, mul0) <- parseMul l
   (ly, rest) <- option (lx, []) $ P.try $ parserest lx
-  return (ly, Branch $ mul0:rest)
+  return (ly, if Prelude.null rest
+              then mul0
+              else Branch $ mul0:rest)
   where
     parserest locals = do
       arthmetic  <- spaces >> matchReserved <$> many1 (oneOf "+-")
@@ -215,7 +238,9 @@ parseAdd l = do
 parseMul l = do
   (lx, una0) <- parseUnary l
   (ly, rest) <- option (lx, []) $ P.try $ parserest lx
-  return (ly, Branch $ una0:rest)
+  return (ly, if Prelude.null rest
+              then una0
+              else Branch $ una0:rest)
   where
     parserest locals = do
       arthmetic <- spaces >> matchReserved <$> many1 (oneOf "*/")
@@ -244,27 +269,27 @@ parseFuncall l = do
   func <- many1 letter
   _ <- spaces >> char '('
   (l0, fstarg) <- option (l, Branch []) (P.try $ spaces >> parseExpr l)
-  (l1, restargs) <- getArgs l0
+  (l1, restargs) <- option (l, []) (P.try $ getArgs 1 l0)
   _ <- spaces >> char ')'
-  return (l1, Leaf Funcall {funcName = func, args = fstarg:restargs})
+  return (l1, Leaf Funcall {funcName = func, args = (0, fstarg):restargs})
   where
-    getArgs lx = do
+    getArgs argnum lx = do
       _           <- spaces >> char ','
-      (lx0, xfst) <- option (lx, Branch []) (P.try $ spaces >> parseExpr lx)
-      (lx1, rest) <- option (lx, []) (P.try $ spaces >> getArgs lx0)
-      return $ (lx1, xfst:rest)
+      (lx0, fstx) <- option (lx, Branch []) (P.try $ spaces >> parseExpr lx)
+      (lx1, rest) <- option (lx, []) (P.try $ spaces >> getArgs (argnum + 1) lx0)
+      return $ (lx1, (argnum, fstx):rest)
 
 parseLVar :: Locals -> Bool -> Parser (Locals, CTree)
 parseLVar locals isassn = do
   var <- many1 letter
   let
     theoffset = if isassn
-                then 8 + (Safe.maximumDef 0 (elems locals))
-                else (Safe.maximumDef 0 (elems locals))
+                then 8 + (Safe.maximumDef 0 (Map.elems locals))
+                else (Safe.maximumDef 0 (Map.elems locals))
     (l, lvar) = maybe
                 (Map.insert var theoffset locals, Leaf $ LVar { offset = theoffset , isassign = isassn})
                 (\x -> (locals, Leaf $ LVar { offset = x , isassign = isassn}))
-                $ locals !? var
+                $ locals Map.!? var
     in
     return (l, lvar)
   -- return . Leaf $ LVar { offset = fromIntegral $ 8 * (1 + (length (takeWhile (var /=) ['a'..'z'])))
@@ -308,7 +333,7 @@ codeGen locals val =
                               : ""
                               : "    push    rbp"
                               : "    mov     rbp, rsp"
-                              :("    sub     rsp, " ++ show (Safe.maximumDef 0 (elems locals)))
+                              :("    sub     rsp, " ++ show (Safe.maximumDef 0 (Map.elems locals)))
                               : ""
                               : ""
                               : "; generated code"
@@ -320,6 +345,8 @@ makeSrc accm (Branch (tree:treeList)) =
   makeSrc generated $ Branch treeList
   where
     generated = makeSrc accm tree
+makeSrc accm (Leaf (Stmt tree)) =
+  makeSrc accm tree ++ "; statement end":("    pop     rax"):"":[]
 makeSrc accm (Leaf (CReserved func)) = accm ++ generated
   where
     generated = stackExec (matchCommand $ func)
@@ -327,10 +354,19 @@ makeSrc accm (Leaf (CtrlStruct ctrl)) = accm ++ generated
   where
     generated = matchCtrlStruct ctrl
 makeSrc accm (Leaf (CInt num)) = accm ++ push num
-makeSrc accm (Leaf (Funcall {funcName = func, args = theargs})) =
-  ("extern    " ++ func):accm ++ ("    call    " ++ func):[]
-  -- where
-  --   generated = callFunc func theargs
+makeSrc accm (Leaf (Funcall {funcName = func, args = argsx})) =
+  ("extern    " ++ func):accm ++ generatedArgs ++ ("    call    " ++ func):"    push    rax":"":[]
+  -- ("extern    " ++ func):accm ++ ("    call    " ++ func):"    push    rax":[]
+  where
+    genargs (num, tree) = case num of
+                                0 -> (makeSrc [] tree) ++ "    pop     rdi":"":[]
+                                1 -> (makeSrc [] tree) ++ "    pop     rsi":"":[]
+                                2 -> (makeSrc [] tree) ++ "    pop     rdx":"":[]
+                                3 -> (makeSrc [] tree) ++ "    pop     rcx":"":[]
+                                4 -> (makeSrc [] tree) ++ "    pop     r8":"":[]
+                                5 -> (makeSrc [] tree) ++ "    pop     r9":"":[]
+                                _ -> (makeSrc [] tree)
+    generatedArgs = Safe.foldr1Def [] (++) $ map genargs (reverse argsx)
 makeSrc accm (Leaf (LVar theoffset True)) = accm ++ generated
   where
     generated = stackAssign theoffset
@@ -395,7 +431,7 @@ stackExec func =
 stackAssign :: Integer -> [String]
 stackAssign theoffset =
   (genLVal theoffset) ++
-  "    pop     rdi":"    pop     rax":"    mov     [rdi], rax":"":[]
+  "    pop     rdi":"    pop     rax":"    mov     [rdi], rax":"    push    rax":"":[]
 
 stackLoadLval :: Integer -> [String]
 stackLoadLval theoffset =
@@ -405,16 +441,28 @@ stackLoadLval theoffset =
 genLVal :: Integer -> [String]
 genLVal theoffset = "    mov     rax, rbp":("    sub     rax, " ++ show theoffset):"    push    rax":[]
 
--- callFunc :: String -> [CTree] -> [String]
--- callFunc =
+-- callFunc :: [String] -> String -> [CTree] -> [String]
+-- callFunc accm func (fstarg:rest) =
+--   "    mov     rsp, 8":[]
+--   ++
+--   (Safe.foldl1Def [""] (++)
+--    (map (\(x, y) -> x:y)
+--     $ zip (map ("    pop " ++) ["rdi", "rsi", "rdx", "rcx", "r8", "r9"] ++ (repeat "    push    rax"))
+--      (map (makeSrc accm) theargs)))
+--   ++
+--   ("    call    " ++ func):"    push    rax":"":[]
+-- callFunc accm func theargs = "; failed":[]
+
+asmMov :: String -> Int -> String
+asmMov reg int = "    mov     " ++ reg ++ show int
 
 main :: IO ()
 main = do
   input <- head <$> Env.getArgs
   case parse mainParser "" input of
-    Right (_, l, val) -> do
-      -- putStrLn . TLazy.unpack . PrettyS.pShow $ val
-      codeGen l val
+    Right parsed -> do
+      -- putStrLn . TLazy.unpack . PrettyS.pShow $ (ctree parsed)
+      codeGen (lvars parsed) (ctree parsed)
     Left err  -> putStrLn $ show err
 
 debugmain :: String -> IO ()
