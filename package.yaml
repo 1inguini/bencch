@@ -24,6 +24,7 @@ dependencies:
 - safe
 - megaparsec
 - containers
+- mtl
 
 - pretty-simple
 - text

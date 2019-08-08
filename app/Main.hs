@@ -1,12 +1,18 @@
 {-# LANGUAGE DuplicateRecordFields #-}
+{-# LANGUAGE OverloadedLabels      #-}
+{-# LANGUAGE OverloadedStrings     #-}
 
 module Main where
 
 -- import Lib
--- import qualified Data.Either                   as E
-import           Data.List                  as List
+import qualified Control.Exception          as Ex
+import           Control.Monad.State        as St
+import           Data.Either                as E
+import qualified Data.List                  as List
 import           Data.Map.Strict            as Map
+import           Data.Maybe                 as May
 import           Data.Text.Lazy             as T
+import           Data.Text.Lazy.Read        as T.R
 import qualified Data.Void                  as V
 import           Prelude                    as P
 import           Safe                       as Safe
@@ -18,59 +24,42 @@ import           Text.Megaparsec.Debug
 import qualified Text.Megaparsec.Error      as MP.E
 import qualified Text.Pretty.Simple         as PrettyS
 
+tshow :: Show a => a -> Text
+tshow = pack . show
+
 type Parser = Parsec V.Void Text
 
 data CNode = Branch [CNode]
            | Statement  CNode
-           | CReserved  Reserved
            | CtrlStruct CtrlStruct
-           | CInt       Int
+           | CInt      {unwrap :: Int}
            | Var       {mayassign :: Maybe CNode, var :: Text}
-           | FunCall   {funcName :: Text, args :: [CNode]}
+           | Funcall   {funcName :: Text, args :: [CNode]}
            | Void
            | EOF
            deriving  (Show, Eq)
 
-data TopLevel = DeFun { funcName :: Text, args :: [CNode], definition :: CNode}
+data TopLevel = DeFun { funcName :: Text, args :: [CNode], definition :: [CNode] }
               deriving  (Show, Eq)
 
-type VarName = String
+type VarName = Text
 type Offset = Integer
-type Locals = Map.Map VarName Offset
+type Variables = Map VarName (Offset, CNode)
 
-data CtrlStruct = If   { cond :: CNode, stmt :: CNode, elst :: CNode }
-                | Whl  { cond :: CNode, stmt :: CNode}
-                | For  { init :: CNode, cond :: CNode, finexpr :: CNode, stmt :: CNode }
-                | Ret
+data CtrlStruct = If  { cond :: CNode, stmt :: CNode, elst :: CNode }
+                | Whl { cond :: CNode, stmt :: CNode}
+                | For { init :: CNode, cond :: CNode, finexpr :: CNode, stmt :: CNode }
+                | Ret CNode
                 deriving (Show, Eq)
-
-data CtrlCond = Start
-              | Mid
-              | End
-              deriving (Show, Eq)
-
-data Reserved = Add
-              | Sub
-              | Mul
-              | Div
-              | Eq
-              | NEq
-              | GrT
-              | GrE
-              | LsT
-              | LsE
-              | Unknown
-              deriving (Show, Eq)
-
 
 spaceConsumer :: Parser ()
 spaceConsumer = L.space
                 space1
-                (L.skipLineComment (pack "//"))
-                (L.skipBlockComment (pack "/*") (pack "*/"))
+                (L.skipLineComment "//")
+                (L.skipBlockComment "/*" "*/")
 
-symbol :: String -> Parser Text
-symbol = (L.symbol spaceConsumer) . pack
+symbol :: Text -> Parser Text
+symbol = (L.symbol spaceConsumer)
 
 parens, braces, angles, brackets :: Parser a -> Parser a
 parens    = between (symbol "(") (symbol ")")
@@ -97,7 +86,7 @@ integer = lexeme L.decimal
 -- signedInteger = L.signed spaceConsumer integer
 
 mainParser :: Parser [TopLevel]
-mainParser = pProgram -- <* eof
+mainParser = pProgram <* eof
 
 pProgram :: Parser [TopLevel]
 pProgram = many pDeclare
@@ -107,12 +96,12 @@ pDeclare = pDeclareFunction
 
 pDeclareFunction :: Parser TopLevel
 pDeclareFunction = do
-  funcName   <- identifier
-  args       <- parens $ pInitialize `sepBy` comma
-  definition <- blockStmt
+  funcName            <- identifier
+  args                <- parens $ pInitialize `sepBy` comma
+  (Branch definition) <- blockStmt
   return DeFun {funcName = funcName, args = args, definition = definition}
 
-pStatement, pExpression, pInitialize, pVar, pEquality, pRelational, pAdd, pMul, pTerm, pNum, pUnary, pFunCall
+pStatement, pExpression, pInitialize, pVar, pEquality, pRelational, pAdd, pMul, pTerm, pNum, pUnary, pFuncall
   :: Parser CNode
 
 pStatement = choice
@@ -127,14 +116,14 @@ blockStmt, simpleStmt, returnStmt, ifStmt, forStmt, whileStmt :: Parser CNode
 
 blockStmt = Branch <$> (try . braces $ many pStatement)
 
-simpleStmt = pExpression <* semicolon
+simpleStmt = Statement <$> pExpression <* semicolon
 
-returnStmt = try $ symbol "return" >> simpleStmt
+returnStmt = try $ symbol "return" >> (CtrlStruct . Ret <$> pExpression <* semicolon)
 
 ifStmt = do
   cond <- try $ symbol "if" >> parens pExpression
   stmt <- pStatement
-  elst <- option (Branch []) (symbol "else" >> pStatement)
+  elst <- option Void (symbol "else" >> pStatement)
   return $ CtrlStruct If { cond = cond, stmt = stmt, elst = elst }
 
 forStmt = do
@@ -166,46 +155,46 @@ pAssign = do
   definition <- option Void pEquality
   return . Branch $ (P.map (\x -> x {mayassign = Just definition}) inits)
 
-pInitialize = pVar
+pInitialize = (\x -> x {mayassign = Just Void}) <$> pVar
 
-pFunCall = try $ do
+pFuncall = try $ do
   func <- identifier
   args <- parens $ option [] (pExpression `sepBy` comma)
-  return FunCall {funcName = func, args = args}
+  return Funcall {funcName = func, args = args}
 
 pEquality = do
   arg0 <- pRelational
   option (arg0) (do eq   <- choice $ (P.map symbol) ["==", "!="]
                     args <- pRelational
-                    return FunCall {funcName = eq, args = [arg0, args]})
+                    return Funcall {funcName = eq, args = [arg0, args]})
 
 pRelational = do
   arg0 <- pAdd
   option (arg0) (do comp <- choice $ (P.map symbol) ["<=", ">=", ">", "<"]
                     args <- pAdd
-                    return FunCall {funcName = comp, args = [arg0, args]})
+                    return Funcall {funcName = comp, args = [arg0, args]})
 
 pAdd = do
   arg0 <- pMul
   option (arg0) (do arth <- choice $ (P.map symbol) ["+", "-"]
                     args <- pMul
-                    return FunCall {funcName = arth, args = [arg0, args]})
+                    return Funcall {funcName = arth, args = [arg0, args]})
 
 pMul = do
   arg0 <- pUnary
   option (arg0) (do arth <- choice $ (P.map symbol) ["*", "/"]
                     args <- pUnary
-                    return FunCall {funcName = arth, args = [arg0, args]})
+                    return Funcall {funcName = arth, args = [arg0, args]})
 
-pUnary = genpUnary "-" (\x -> FunCall {funcName = (T.singleton '-'), args = [CInt 0, x]}) id pTerm
+pUnary = genpUnary "-" (\x -> Funcall {funcName = (T.singleton '-'), args = [CInt 0, x]}) id pTerm
          <|> genpUnary "+" id id pTerm
   where
-    genpUnary :: String -> (b -> c) -> (b -> c) -> Parser b -> Parser c
+    genpUnary :: Text -> (b -> c) -> (b -> c) -> Parser b -> Parser c
     genpUnary sym op0 op1 parg =
       (op0 <$> (try $ symbol sym >> parg))
       <|> op1 <$> parg
 
-pTerm = choice [ pFunCall
+pTerm = choice [ pFuncall
                , pVar
                , pNum
                , parens pExpression]
@@ -216,160 +205,234 @@ pVar = do
 
 pNum = CInt <$> try integer
 
-matchReserved :: Text -> CNode
-matchReserved x = CReserved
-  $ case unpack x of
-      "+"  -> Add
-      "-"  -> Sub
-      "*"  -> Mul
-      "/"  -> Div
-      "==" -> Eq
-      "!=" -> NEq
-      "<"  -> LsT
-      "<=" -> LsE
-      ">"  -> GrT
-      ">=" -> GrE
-      _    -> Unknown
+data CState = CState
+            { stnum   :: Integer
+            , funcs   :: [Text]
+            , externs :: [Text]
+            , vars    :: Variables
+            , accm    :: [Text]
+            , defName :: Text
+            } deriving (Show, Eq)
 
--- codeGen :: Parsed -> IO ()
--- codeGen p =
---       mapM_ putStrLn
---         $ (filter (List.isPrefixOf "extern") code) ++ (filter (not . (List.isPrefixOf "extern")) code)
---         where
---           code = (makeSrc ( "section .text"
---                           : "global _start"
---                           : ""
---                           : "_start:"
---                           : "    call    main"
---                           : ""
---                           : "_exit:"
---                           : "    mov     rax, 1"
---                           -- : "    pop     rbx"
---                           : "    int     0x80"
---                           : ""
---                           : "; generated code"
---                           : "":[]) p)
+data NasmGenError = VariableNotAssigned Text
+                  | UnmatchedArgNum     {funcName :: Text, argsgot :: [CNode]}
+                  deriving (Show, Eq)
 
--- makeSrc :: [String] -> Parsed -> [String]
--- makeSrc accm p@Parsed {ctree = Leaf (DeFun {funcName = func, definition = tree})} =
---   accm ++ generated
---   where
---     registers :: [String]
---     registers = foldl (++) [] $ List.genericTake argnum (map (reverse . push) ["rdi", "rsi", "rdx", "rcx", "r8", "r9"])
---     argnum = maxoffset `div` 8
---     maxoffset = Safe.maximumDef 8 (Map.elems (lvars p))
---     generated = (func ++ ":")
---                 :"; prologe"
---                 : "    push    rbp"
---                 : "    mov     rbp, rsp"
---                 :("    sub     rsp, " ++ show maxoffset):[]
---                 -- : registers
---                 -- ++ "":(foldl (++) [] $ map (stackAssign . show) $ drop 2 [-8,0..maxoffset])
---                 ++ "":makeSrc [] p {ctree = tree} ++ [""]
--- makeSrc accm Parsed {ctree = Branch []} = accm
--- makeSrc accm p@Parsed {ctree = Branch (tree:treeList)} =
---   makeSrc generated $ p {ctree = Branch treeList}
---   where
---     generated = makeSrc accm p {ctree = tree}
--- makeSrc accm p@Parsed {ctree = Leaf (Stmt tree)} =
---   makeSrc accm p {ctree = tree} ++ "; statement end":("    pop     rax"):"":[]
--- makeSrc accm Parsed {ctree = Leaf (CReserved func)} = accm ++ generated
---   where
---     generated = stackExec (matchCommand $ func)
--- makeSrc accm Parsed {ctree = Leaf (CtrlStruct ctrl)} = accm ++ generated
---   where
---     generated = matchCtrlStruct ctrl
--- makeSrc accm Parsed {ctree = Leaf (CInt num)} = accm ++ push (show num)
--- makeSrc accm p@Parsed {ctree = Leaf (Funcall {funcName = func, args = argsx})} =
---   -- ("extern    " ++ func):
---   extern:accm ++ generatedArgs ++ ("    call    " ++ func):"    push    rax":"":[]
---   -- ("extern    " ++ func):accm ++ ("    call    " ++ func):"    push    rax":[]
---   where
---     extern = if func `elem` (funcs p)
---              then []
---              else "extern    " ++ func
---     genargs (num, tree) = case num of
---                                 0 -> (makeSrc [] p {ctree = tree}) ++ "    pop     rdi":"":[]
---                                 1 -> (makeSrc [] p {ctree = tree}) ++ "    pop     rsi":"":[]
---                                 2 -> (makeSrc [] p {ctree = tree}) ++ "    pop     rdx":"":[]
---                                 3 -> (makeSrc [] p {ctree = tree}) ++ "    pop     rcx":"":[]
---                                 4 -> (makeSrc [] p {ctree = tree}) ++ "    pop     r8":"":[]
---                                 5 -> (makeSrc [] p {ctree = tree}) ++ "    pop     r9":"":[]
---                                 _ -> (makeSrc [] p {ctree = tree})
---     generatedArgs = Safe.foldr1Def [] (++) $ map genargs (reverse argsx)
--- makeSrc accm Parsed {ctree = Leaf (LVar theoffset True)} = accm ++ generated
---   where
---     generated = stackAssign (show theoffset)
--- makeSrc accm Parsed {ctree = Leaf (LVar theoffset False)} = accm ++ generated
---   where
---     generated = stackLoadLval (show theoffset)
--- makeSrc accm Parsed {ctree = Leaf EOF} = accm
+type CStateOrError = Either NasmGenError CState
 
--- matchCommand :: Reserved -> [String]
--- matchCommand func =
---   case func of
---     Add -> "    add     rax, rdi":[]
---     Sub -> "    sub     rax, rdi":[]
---     Mul -> "    imul    rdi"     :[]
---     Div -> "    idiv    rdi"     :[]
---     Eq  -> "    cmp     rax, rdi":"    sete    al" :"    movzx   rax, al":[]
---     NEq -> "    cmp     rax, rdi":"    setne   al" :"    movzx   rax, al":[]
---     GrT -> "    cmp     rdi, rax":"    setl    al" :"    movzx   rax, al":[]
---     GrE -> "    cmp     rdi, rax":"    setle   al" :"    movzx   rax, al":[]
---     LsT -> "    cmp     rax, rdi":"    setl    al" :"    movzx   rax, al":[]
---     LsE -> "    cmp     rax, rdi":"    setle   al" :"    movzx   rax, al":[]
---     Unknown -> []
+eitherModify :: (CState -> CState) -> St.State CStateOrError ()
+eitherModify f = modify (fmap f)
 
--- matchCtrlStruct :: CtrlStruct -> [String]
--- matchCtrlStruct ctrl =
---   case ctrl of
---     If {cond = Start, nthLabel = lnum}  -> "    pop     rax":
---                                            "    cmp     rax, 0":
---                                            ("    je      Lelse" ++ show lnum):"":[]
---     If {cond = Mid, nthLabel = lnum}    -> ("    jmp     Lend" ++ show lnum):("Lelse" ++ show lnum ++ ":"):[]
---     If {cond = End, nthLabel = lnum}    -> ("Lend" ++ show lnum ++ ":"):"":[]
-
---     Whl {cond = Start, nthLabel = lnum} -> ("Lbegin" ++ show lnum ++ ":"):[]
---     Whl {cond = Mid, nthLabel = lnum}   -> "    pop     rax":
---                                            "    cmp     rax, 0":
---                                            ("    je      Lend" ++ show lnum):"":[]
---     Whl {cond = End, nthLabel = lnum}   -> ("    jmp     Lbegin" ++ show lnum):("Lend" ++ show lnum ++ ":"):[]
-
---     For {cond = Start, nthLabel = lnum} -> ("Lbegin" ++ show lnum ++ ":"):[]
---     For {cond = Mid, nthLabel = lnum}   ->  "    pop     rax":
---                                             "    cmp     rax, 0":
---                                            ("    je      Lend" ++ show lnum):"":[]
---     For {cond = End, nthLabel = lnum}   -> ("    jmp     Lbegin" ++ show lnum):("Lend" ++ show lnum ++ ":"):[]
-
---     Ret -> "; epiloge":
---            "":
---            "    pop     rax":
---            "    mov     rbx, rax":
---            "    mov     rsp, rbp":
---            "    pop     rbp":
---            "    ret":"":[]
+program2nasm :: [TopLevel] -> [Text]
+program2nasm tops =
+  let
+    toText :: CState -> [Text]
+    toText (CState {accm = accm}) = accm
+    genExtern :: CState -> [Text]
+    genExtern (CState {externs = externs}) = P.map (\func -> "extern " <> func) externs
+    eitherCState = (execState (mapM_ toplevel2nasm tops)
+               $ Right CState { stnum   = 0
+                              , funcs   = []
+                              , externs = []
+                              , vars    = Map.empty
+                              , accm    = []
+                              , defName = T.empty})
+  in
+  case eitherCState of
+    Right cstate -> genExtern cstate ++
+                    [ "section .text"
+                    , "global _start"
+                    , ""
+                    , "_start:"
+                    , "    call    main"
+                    , ""
+                    , "_exit:"
+                    , "    mov     rax, 1"
+                    , "    int     0x80"
+                    , ""
+                    , "; generated code"
+                    , ""] ++
+                    toText cstate
+    Left err     -> [tshow err]
 
 
--- push :: String -> [String]
--- push num =
---   ("    push    " ++ num):"":[]
+toplevel2nasm :: TopLevel -> St.State CStateOrError ()
+toplevel2nasm DeFun {funcName = funcName, args = args, definition = definition} = do
+  eitherModify $ \s -> s { defName = funcName
+                         , funcs = funcName:(funcs s)
+                         , accm = accm s ++
+                                  [ funcName <> ":"
+                                  , "; prologe"
+                                  , "    push    rbp"
+                                  , "    mov     rbp, rsp"
+                                  , "    sub     rsp, 0", ""]}
+  mapM_ cnode2nasm (args ++ definition)
 
--- stackExec :: [String] -> [String]
--- stackExec func =
---   "    pop     rdi":"    pop     rax":func ++ "    push    rax":"":[]
+unwrapEitherS :: (CState -> St.State CStateOrError ()) -> CStateOrError -> St.State CStateOrError ()
+unwrapEitherS m (Right s)    = m s
+unwrapEitherS _ err@(Left _) = put err
 
--- stackAssign :: String -> [String]
--- stackAssign theoffset =
---   (genLVal theoffset) ++
---   "    pop     rdi":"    pop     rax":"    mov     [rdi], rax":"    push    rax":"":[]
+cnode2nasm :: CNode -> St.State CStateOrError ()
+cnode2nasm (Branch []) = get >>= put
+cnode2nasm (Branch (node:nodeList)) =
+  cnode2nasm node >> cnode2nasm (Branch nodeList)
+cnode2nasm (Statement node) = do
+  cnode2nasm node
+  eitherModify (\s -> s { stnum = stnum s + 1
+                        , accm = accm s ++
+                                 [ "; statement end"
+                                 , "    pop     rax"
+                                 , ""]})
+cnode2nasm (CInt num) = eitherModify $ \s ->
+  s {accm = accm s ++ (push . pack . show) num}
 
--- stackLoadLval :: String -> [String]
--- stackLoadLval theoffset =
---   (genLVal theoffset) ++
---   "    pop     rax":"    mov     rax, [rax]":"    push    rax":"":[]
+cnode2nasm (Var {var = var, mayassign = Nothing}) = modify $ \s -> case s of
+  Right s -> maybe
+             (Left . VariableNotAssigned $ var) (\(offset, _) -> Right s { accm = accm s ++ stackLoadLval offset})
+             $ vars s !? var
+  err     -> err
 
--- genLVal :: String -> [String]
--- genLVal theoffset = "    mov     rax, rbp":("    sub     rax, " ++ theoffset):"    push    rax":[]
+cnode2nasm (Var {var = var, mayassign = Just value}) = do
+  cnode2nasm value
+  eitherModify $ \s ->
+    maybe
+    (let newoffset = 8 + (maximumDef 0 $ P.map fst (elems $ vars s)) in
+       s { vars = insert var (newoffset, value) $ vars s
+         , accm = accm s ++ stackAssign newoffset})
+    (\(offset, _) -> s { accm = accm s ++ stackAssign offset})
+    $ vars s !? var
+
+cnode2nasm (Funcall {funcName = funcName, args = args}) =
+  case (funcName `elem` ["+", "-", "*", "/", "==", "!=", ">", ">=", "<", "<="], P.length args) of
+    (True, 2) -> do cnode2nasm (atDef Void args 0)
+                    cnode2nasm (atDef Void args 1)
+                    eitherModify $ \s -> s { accm = accm s ++ stackExec funcName }
+    (True, _) -> modify $ \_ -> Left UnmatchedArgNum {funcName = funcName, argsgot = args }
+    (False, _) -> get >>= unwrapEitherS
+      (\s -> do
+          if funcName `elem` funcs s
+          then modify id
+          else eitherModify $ \s -> s {externs = funcName:(externs s)}
+          mapM_ (\(num, register) ->
+                   case atMay args num of
+                     Just arg -> do
+                       cnode2nasm arg
+                       eitherModify $ \s -> s {accm = accm s ++ ["    pop     " <> register, ""]}
+                     Nothing  -> cnode2nasm Void)
+            [ (0, "rdi")
+            , (1, "rsi")
+            , (2, "rdx")
+            , (3, "rcx")
+            , (4, "r8")
+            , (5, "r9")]
+          mapM_ cnode2nasm (P.reverse $ P.drop 6 args)
+          eitherModify (\s -> s {accm = accm s ++ ["    call    " <> funcName, ""]}))
+
+cnode2nasm (CtrlStruct (If {cond = cond, stmt = stmt, elst = Void})) =
+  get >>= unwrapEitherS (\s ->
+  let lxxx = (tshow . stnum) s in do
+    cnode2nasm cond
+    eitherModify $ \s -> s {accm = accm s ++
+                             [ "    pop     rax"
+                             , "    cmp     rax, 0"
+                             , "    je      Lend" <> lxxx,""]}
+    cnode2nasm stmt
+    eitherModify $ \s -> s {accm = accm s ++ ["Lend" <> lxxx <> ":"]})
+
+cnode2nasm (CtrlStruct (If {cond = cond, stmt = stmt, elst = elst})) =
+  get >>= unwrapEitherS (\s ->
+  let lxxx = (tshow . stnum) s in do
+    cnode2nasm cond
+    eitherModify $ \s -> s {accm = accm s ++
+                             [ "    pop     rax"
+                             , "    cmp     rax, 0"
+                             , "    je      Lelse" <> lxxx, ""]}
+    cnode2nasm stmt
+    eitherModify $ \s -> s {accm = accm s ++
+                             [ "    jmp     Lend" <> lxxx
+                             , "Lelse" <> lxxx <> ":"]}
+    cnode2nasm elst
+    eitherModify $ \s -> s {accm = accm s ++ ("Lend" <> lxxx <> ":"):[]})
+
+cnode2nasm (CtrlStruct (Whl {cond = cond, stmt = stmt})) =
+  get >>= unwrapEitherS
+  (\s -> let lxxx = (tshow . stnum) s in do
+      eitherModify $ \s -> s {accm = accm s ++ ("Lbegin" <> lxxx <> ":"):[]}
+      cnode2nasm cond
+      eitherModify $ \s -> s {accm = accm s ++
+                                  [ "    pop     rax"
+                                  , "    cmp     rax, 0"
+                                  , "    je      Lend" <> lxxx, ""]}
+      cnode2nasm stmt
+      eitherModify $ \s -> s {accm = accm s ++
+                                  [ "    jmp     Lbegin" <> lxxx
+                                  , "Lend" <> lxxx <> ":"]})
+
+cnode2nasm (CtrlStruct (For {init = init, cond = cond, finexpr = finexpr, stmt = stmt})) =
+  get >>= unwrapEitherS
+  (\s -> let lxxx = (tshow . stnum) s in do
+      cnode2nasm init
+      eitherModify $ \s -> s {accm = accm s ++ ["Lbegin" <> lxxx <> ":"]}
+      cnode2nasm cond
+      eitherModify $ \s -> s {accm = accm s ++
+                                  [ "    pop     rax"
+                                  , "    cmp     rax, 0"
+                                  , "    je      Lend" <> lxxx, ""]}
+      cnode2nasm stmt
+      cnode2nasm finexpr
+      eitherModify $ \s -> s {accm = accm s ++
+                                  [ "    jmp     Lbegin" <> lxxx
+                                  , "Lend" <> lxxx <> ":"]})
+
+cnode2nasm (CtrlStruct (Ret node)) = do
+  cnode2nasm node
+  eitherModify $ \s -> s {accm = accm s ++
+                                 ["; epiloge"
+                                 , ""
+                                 , "    pop     rax"
+                                 , "    mov     rbx, rax"
+                                 , "    mov     rsp, rbp"
+                                 , "    pop     rbp"
+                                 , "    ret", ""]}
+
+cnode2nasm EOF = get >>= put
+cnode2nasm Void = get >>= put
+
+stackExec :: Text -> [Text]
+stackExec func =
+  "    pop     rdi":"    pop     rax":matchCommand func ++ "    push    rax":"":[]
+
+matchCommand :: Text -> [Text]
+matchCommand func =
+  case func of
+    "+"  -> "    add     rax, rdi":[]
+    "-"  -> "    sub     rax, rdi":[]
+    "*"  -> "    imul    rdi"     :[]
+    "/"  -> "    idiv    rdi"     :[]
+    "==" -> "    cmp     rax, rdi":"    sete    al" :"    movzx   rax, al":[]
+    "!=" -> "    cmp     rax, rdi":"    setne   al" :"    movzx   rax, al":[]
+    ">"  -> "    cmp     rdi, rax":"    setl    al" :"    movzx   rax, al":[]
+    ">=" -> "    cmp     rdi, rax":"    setle   al" :"    movzx   rax, al":[]
+    "<"  -> "    cmp     rax, rdi":"    setl    al" :"    movzx   rax, al":[]
+    "<=" -> "    cmp     rax, rdi":"    setle   al" :"    movzx   rax, al":[]
+    _    -> []
+
+push :: Text -> [Text]
+push num =
+  (T.concat ["    push    ", num]):T.empty:[]
+
+stackAssign :: (Integral a, Show a) => a -> [Text]
+stackAssign theoffset =
+  (genLVal theoffset) ++
+  "    pop     rdi":"    pop     rax":"    mov     [rdi], rax":"    push    rax":"":[]
+
+stackLoadLval :: (Integral a, Show a) => a -> [Text]
+stackLoadLval theoffset =
+  (genLVal theoffset) ++
+  "    pop     rax":"    mov     rax, [rax]":"    push    rax":"":[]
+
+genLVal :: (Integral a, Show a) => a -> [Text]
+genLVal theoffset = "    mov     rax, rbp":("    sub     rax, " <> (tshow theoffset)):"    push    rax":[]
 
 main :: IO ()
 main = do
@@ -377,8 +440,8 @@ main = do
   -- parseTest mainParser input
   case parse mainParser "" input of
     Right parsed -> do
-      putStrLn . unpack . PrettyS.pShow $ parsed
-      -- codeGen parsed
+      -- putStrLn . unpack . PrettyS.pShow $ parsed
+      mapM_ (putStrLn . unpack) $ program2nasm parsed
     Left err  -> putStrLn $ MP.E.errorBundlePretty err
 
 debugmain :: String -> IO ()
@@ -386,5 +449,5 @@ debugmain input =
     case parse mainParser "" (pack input) of
     Right parsed -> do
       putStrLn . unpack . PrettyS.pShow $ parsed
-      -- codeGen parsed
+      mapM_ (putStrLn . unpack) $ program2nasm parsed
     Left err  -> putStrLn $ MP.E.errorBundlePretty err
