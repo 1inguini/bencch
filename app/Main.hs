@@ -259,14 +259,13 @@ program2nasm tops =
 toplevel2nasm :: TopLevel -> St.State CStateOrError ()
 toplevel2nasm DeFun {funcName = funcName, args = args, definition = definition} = do
   eitherModify $ \s -> s { defName = funcName
-                         , funcs = funcName:(funcs s)
-                         , accm = accm s ++
-                                  [ funcName <> ":"
+                         , funcs = funcName:(funcs s)}
+  mapM_ cnode2nasm (args ++ definition)
+  eitherModify $ \s -> s { accm = [ funcName <> ":"
                                   , "; prologe"
                                   , "    push    rbp"
                                   , "    mov     rbp, rsp"
-                                  , "    sub     rsp, 0", ""]}
-  mapM_ cnode2nasm (args ++ definition)
+                                  , "    sub     rsp, " <> tshow (maximumDef 0 $ P.map fst (elems $ vars s)), ""] ++ accm s }
 
 unwrapEitherS :: (CState -> St.State CStateOrError ()) -> CStateOrError -> St.State CStateOrError ()
 unwrapEitherS m (Right s)    = m s
