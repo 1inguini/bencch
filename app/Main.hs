@@ -258,14 +258,28 @@ program2nasm tops =
 
 toplevel2nasm :: TopLevel -> St.State CStateOrError ()
 toplevel2nasm DeFun {funcName = funcName, args = args, definition = definition} = do
+  mapM_ genLocals (args ++ definition)
   eitherModify $ \s -> s { defName = funcName
-                         , funcs = funcName:(funcs s)}
-  mapM_ cnode2nasm (args ++ definition)
-  eitherModify $ \s -> s { accm = [ funcName <> ":"
+                         , funcs = funcName:(funcs s)
+                         , accm = accm s ++
+                                  [ funcName <> ":"
                                   , "; prologe"
                                   , "    push    rbp"
                                   , "    mov     rbp, rsp"
-                                  , "    sub     rsp, " <> tshow (maximumDef 0 $ P.map fst (elems $ vars s)), ""] ++ accm s }
+                                  , "    sub     rsp, " <> tshow (maximumDef 0 $ P.map fst (elems $ vars s)), ""] }
+  mapM_ cnode2nasm (args ++ definition)
+
+genLocals :: CNode -> St.State CStateOrError ()
+genLocals Var {var = var, mayassign = Just _} = do
+      eitherModify $ \s ->
+          maybe s
+          (\_ ->
+             let newoffset = 8 + (maximumDef 0 $ P.map fst (elems $ vars s)) in
+                        s { vars = insert var (newoffset, Void) $ vars s})
+          $ vars s !? var
+genLocals (Branch (node:nodeList)) =
+  genLocals node >> genLocals (Branch nodeList)
+genLocals _ = modify id
 
 unwrapEitherS :: (CState -> St.State CStateOrError ()) -> CStateOrError -> St.State CStateOrError ()
 unwrapEitherS m (Right s)    = m s
