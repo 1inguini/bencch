@@ -251,6 +251,7 @@ program2nasm tops =
                     , "    call    main"
                     , ""
                     , "_exit:"
+                    , "    mov     rbx, rax"
                     , "    mov     rax, 1"
                     , "    int     0x80"
                     , ""
@@ -261,6 +262,7 @@ program2nasm tops =
 
 toplevel2nasm :: TopLevel -> St.State CStateOrError ()
 toplevel2nasm DeFun {funcName = funcName, args = args, definition = definition} = do
+  eitherModify $ \s -> s { vars = Map.empty }
   mapM_ genLocals (args ++ definition)
   eitherModify $ \s -> s { defName = funcName
                          , funcs = funcName:(funcs s)
@@ -271,9 +273,8 @@ toplevel2nasm DeFun {funcName = funcName, args = args, definition = definition} 
                                   , "    mov     rbp, rsp"
                                   , "    sub     rsp, " <> tshow (maximumDef 0 $ P.map fst (elems $ vars s)), ""] }
   assign6Args 8 (P.take (P.length args) sysVCallRegs)
-  assignRestArgs (8 * (P.length args)) (P.reverse $ P.drop (P.length sysVCallRegs) args)
+  assignRestArgs (8 * P.length args) (P.drop (P.length sysVCallRegs) args)
   mapM_ cnode2nasm definition
-  eitherModify $ \s -> s { vars = Map.empty}
   where
     assign6Args :: (Show a, Integral a) => a -> [Text] -> St.State CStateOrError ()
     assign6Args _ [] = modify id
@@ -353,7 +354,8 @@ cnode2nasm Funcall {funcName = funcName, args = args} =
             else eitherModify $ \s -> s {externs = funcName:(externs s)}
           fst6args 0 sysVCallRegs
           mapM_ cnode2nasm (P.reverse $ P.drop (P.length sysVCallRegs) args)
-          eitherModify (\s -> s {accm = accm s ++ ["    call    " <> funcName, ""]}))
+          eitherModify (\s -> s {accm = accm s ++ [ "    call    " <> funcName
+                                                  , "    push    rax",""]}))
   where
     fst6args :: Integral a => a -> [Text] -> St.State CStateOrError ()
     fst6args 6 _ = modify id
@@ -427,7 +429,6 @@ cnode2nasm (CtrlStruct (Ret node)) = do
                                  ["; epiloge"
                                  , ""
                                  , "    pop     rax"
-                                 , "    mov     rbx, rax"
                                  , "    mov     rsp, rbp"
                                  , "    pop     rbp"
                                  , "    ret", ""]}
