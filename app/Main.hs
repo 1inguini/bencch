@@ -74,7 +74,7 @@ identifier =
   where
     rawident = do
       head <- letterChar
-      rest <- many (try letterChar <|> single '_')
+      rest <- many (try letterChar <|> try digitChar <|> single '_')
       return . pack $ head:rest
 
 semicolon = symbol ";"
@@ -235,12 +235,12 @@ program2nasm tops =
     genExtern :: CState -> [Text]
     genExtern (CState {externs = externs}) = P.map (\func -> "extern " <> func) externs
     eitherCState = (execState (mapM_ toplevel2nasm tops)
-               $ Right CState { stnum   = 0
-                              , funcs   = []
-                              , externs = []
-                              , vars    = Map.empty
-                              , accm    = []
-                              , defName = T.empty})
+                     $ Right CState { stnum   = 0
+                                    , funcs   = []
+                                    , externs = []
+                                    , vars    = Map.empty
+                                    , accm    = []
+                                    , defName = T.empty})
   in
   case eitherCState of
     Right cstate -> genExtern cstate ++
@@ -270,9 +270,10 @@ toplevel2nasm DeFun {funcName = funcName, args = args, definition = definition} 
                                   , "    push    rbp"
                                   , "    mov     rbp, rsp"
                                   , "    sub     rsp, " <> tshow (maximumDef 0 $ P.map fst (elems $ vars s)), ""] }
-  assign6Args 8 sysVCallRegs
-  mapM_ cnode2nasm (P.reverse $ P.drop (P.length sysVCallRegs) args)
+  assign6Args 8 (P.take (P.length args) sysVCallRegs)
+  assignRestArgs (8 * (P.length args)) (P.reverse $ P.drop (P.length sysVCallRegs) args)
   mapM_ cnode2nasm definition
+  eitherModify $ \s -> s { vars = Map.empty}
   where
     assign6Args :: (Show a, Integral a) => a -> [Text] -> St.State CStateOrError ()
     assign6Args _ [] = modify id
@@ -282,6 +283,14 @@ toplevel2nasm DeFun {funcName = funcName, args = args, definition = definition} 
                                       stackAssign offset}
       cnode2nasm $ Statement Void
       assign6Args (offset + 8) registers
+
+    assignRestArgs :: (Show a, Integral a) => a -> [b] -> St.State CStateOrError ()
+    assignRestArgs _ [] = modify id
+    assignRestArgs offset (_:xs) = do
+      eitherModify $ \s -> s { accm = accm s ++
+                                      stackAssign offset}
+      cnode2nasm $ Statement Void
+      assignRestArgs (offset - 8) xs
 
 genLocals :: CNode -> St.State CStateOrError ()
 genLocals Var {var = var, mayassign = Just _} = do
