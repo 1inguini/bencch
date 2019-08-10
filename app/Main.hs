@@ -8,6 +8,7 @@ module Main where
 import qualified Control.Exception          as Ex
 import           Control.Monad.State        as St
 import           Data.Either                as E
+import qualified Data.IntMap.Strict         as IMap
 import qualified Data.List                  as List
 import           Data.Map.Strict            as Map
 import           Data.Maybe                 as May
@@ -97,7 +98,7 @@ pDeclare = pDeclareFunction
 pDeclareFunction :: Parser TopLevel
 pDeclareFunction = do
   funcName            <- identifier
-  args                <- parens $ pInitialize `sepBy` comma
+  args                <- parens $ (Statement <$> pInitialize) `sepBy` comma
   (Branch definition) <- blockStmt
   return DeFun {funcName = funcName, args = args, definition = definition}
 
@@ -223,6 +224,9 @@ type CStateOrError = Either NasmGenError CState
 eitherModify :: (CState -> CState) -> St.State CStateOrError ()
 eitherModify f = modify (fmap f)
 
+sysVCallRegs :: [Text]
+sysVCallRegs = [ "rdi", "rsi", "rdx", "rcx", "r8", "r9"]
+
 program2nasm :: [TopLevel] -> [Text]
 program2nasm tops =
   let
@@ -255,7 +259,6 @@ program2nasm tops =
                     toText cstate
     Left err     -> [tshow err]
 
-
 toplevel2nasm :: TopLevel -> St.State CStateOrError ()
 toplevel2nasm DeFun {funcName = funcName, args = args, definition = definition} = do
   mapM_ genLocals (args ++ definition)
@@ -267,18 +270,31 @@ toplevel2nasm DeFun {funcName = funcName, args = args, definition = definition} 
                                   , "    push    rbp"
                                   , "    mov     rbp, rsp"
                                   , "    sub     rsp, " <> tshow (maximumDef 0 $ P.map fst (elems $ vars s)), ""] }
-  mapM_ cnode2nasm (args ++ definition)
+  assign6Args 8 sysVCallRegs
+  mapM_ cnode2nasm (P.reverse $ P.drop (P.length sysVCallRegs) args)
+  mapM_ cnode2nasm definition
+  where
+    assign6Args :: (Show a, Integral a) => a -> [Text] -> St.State CStateOrError ()
+    assign6Args _ [] = modify id
+    assign6Args offset (reg:registers) = do
+      eitherModify $ \s -> s { accm = accm s ++
+                                      push reg ++
+                                      stackAssign offset}
+      cnode2nasm $ Statement Void
+      assign6Args (offset + 8) registers
 
 genLocals :: CNode -> St.State CStateOrError ()
 genLocals Var {var = var, mayassign = Just _} = do
       eitherModify $ \s ->
-          maybe s
-          (\_ ->
-             let newoffset = 8 + (maximumDef 0 $ P.map fst (elems $ vars s)) in
-                        s { vars = insert var (newoffset, Void) $ vars s})
+          maybe
+          (let newoffset = 8 + (maximumDef 0 $ P.map fst (elems $ vars s)) in
+              s { vars = insert var (newoffset, Void) (vars s)})
+          (\_ -> s)
           $ vars s !? var
-genLocals (Branch (node:nodeList)) =
-  genLocals node >> genLocals (Branch nodeList)
+genLocals (Branch nodeList) =
+  mapM_ genLocals nodeList
+genLocals (Statement node) =
+  genLocals node
 genLocals _ = modify id
 
 unwrapEitherS :: (CState -> St.State CStateOrError ()) -> CStateOrError -> St.State CStateOrError ()
@@ -287,8 +303,8 @@ unwrapEitherS _ err@(Left _) = put err
 
 cnode2nasm :: CNode -> St.State CStateOrError ()
 cnode2nasm (Branch []) = get >>= put
-cnode2nasm (Branch (node:nodeList)) =
-  cnode2nasm node >> cnode2nasm (Branch nodeList)
+cnode2nasm (Branch nodeList) =
+  mapM_ cnode2nasm nodeList
 cnode2nasm (Statement node) = do
   cnode2nasm node
   eitherModify (\s -> s { stnum = stnum s + 1
@@ -299,23 +315,23 @@ cnode2nasm (Statement node) = do
 cnode2nasm (CInt num) = eitherModify $ \s ->
   s {accm = accm s ++ (push . pack . show) num}
 
-cnode2nasm (Var {var = var, mayassign = Nothing}) = modify $ \s -> case s of
+cnode2nasm Var {var = var, mayassign = Nothing} = modify $ \s -> case s of
   Right s -> maybe
              (Left . VariableNotAssigned $ var) (\(offset, _) -> Right s { accm = accm s ++ stackLoadLval offset})
              $ vars s !? var
   err     -> err
 
-cnode2nasm (Var {var = var, mayassign = Just value}) = do
+cnode2nasm Var {var = var, mayassign = Just value} = do
   cnode2nasm value
   eitherModify $ \s ->
     maybe
     (let newoffset = 8 + (maximumDef 0 $ P.map fst (elems $ vars s)) in
        s { vars = insert var (newoffset, value) $ vars s
          , accm = accm s ++ stackAssign newoffset})
-    (\(offset, _) -> s { accm = accm s ++ stackAssign offset})
+    (\(offset, _) -> s { accm = accm s ++ stackAssign offset })
     $ vars s !? var
 
-cnode2nasm (Funcall {funcName = funcName, args = args}) =
+cnode2nasm Funcall {funcName = funcName, args = args} =
   case (funcName `elem` ["+", "-", "*", "/", "==", "!=", ">", ">=", "<", "<="], P.length args) of
     (True, 2) -> do cnode2nasm (atDef Void args 0)
                     cnode2nasm (atDef Void args 1)
@@ -324,22 +340,21 @@ cnode2nasm (Funcall {funcName = funcName, args = args}) =
     (False, _) -> get >>= unwrapEitherS
       (\s -> do
           if funcName `elem` funcs s
-          then modify id
-          else eitherModify $ \s -> s {externs = funcName:(externs s)}
-          mapM_ (\(num, register) ->
-                   case atMay args num of
-                     Just arg -> do
-                       cnode2nasm arg
-                       eitherModify $ \s -> s {accm = accm s ++ ["    pop     " <> register, ""]}
-                     Nothing  -> cnode2nasm Void)
-            [ (0, "rdi")
-            , (1, "rsi")
-            , (2, "rdx")
-            , (3, "rcx")
-            , (4, "r8")
-            , (5, "r9")]
-          mapM_ cnode2nasm (P.reverse $ P.drop 6 args)
+            then modify id
+            else eitherModify $ \s -> s {externs = funcName:(externs s)}
+          fst6args 0 sysVCallRegs
+          mapM_ cnode2nasm (P.reverse $ P.drop (P.length sysVCallRegs) args)
           eitherModify (\s -> s {accm = accm s ++ ["    call    " <> funcName, ""]}))
+  where
+    fst6args :: Integral a => a -> [Text] -> St.State CStateOrError ()
+    fst6args 6 _ = modify id
+    fst6args index registers =
+      case atMay args (fromIntegral index) of
+        Just arg -> do
+          cnode2nasm arg
+          eitherModify $ \s -> s {accm = accm s ++ ["    pop     " <> (atDef "" registers $ fromIntegral index), ""]}
+          fst6args (succ index) registers
+        Nothing  -> modify id
 
 cnode2nasm (CtrlStruct (If {cond = cond, stmt = stmt, elst = Void})) =
   get >>= unwrapEitherS (\s ->
@@ -413,39 +428,46 @@ cnode2nasm Void = get >>= put
 
 stackExec :: Text -> [Text]
 stackExec func =
-  "    pop     rdi":"    pop     rax":matchCommand func ++ "    push    rax":"":[]
+  "    pop     r11":"    pop     rax":matchCommand func ++ "    push    rax":"":[]
 
 matchCommand :: Text -> [Text]
 matchCommand func =
   case func of
-    "+"  -> "    add     rax, rdi":[]
-    "-"  -> "    sub     rax, rdi":[]
-    "*"  -> "    imul    rdi"     :[]
-    "/"  -> "    idiv    rdi"     :[]
-    "==" -> "    cmp     rax, rdi":"    sete    al" :"    movzx   rax, al":[]
-    "!=" -> "    cmp     rax, rdi":"    setne   al" :"    movzx   rax, al":[]
-    ">"  -> "    cmp     rdi, rax":"    setl    al" :"    movzx   rax, al":[]
-    ">=" -> "    cmp     rdi, rax":"    setle   al" :"    movzx   rax, al":[]
-    "<"  -> "    cmp     rax, rdi":"    setl    al" :"    movzx   rax, al":[]
-    "<=" -> "    cmp     rax, rdi":"    setle   al" :"    movzx   rax, al":[]
+    "+"  -> "    add     rax, r11":[]
+    "-"  -> "    sub     rax, r11":[]
+    "*"  -> "    imul    r11"     :[]
+    "/"  -> "    idiv    r11"     :[]
+    "==" -> "    cmp     rax, r11":"    sete    al" :"    movzx   rax, al":[]
+    "!=" -> "    cmp     rax, r11":"    setne   al" :"    movzx   rax, al":[]
+    ">"  -> "    cmp     r11, rax":"    setl    al" :"    movzx   rax, al":[]
+    ">=" -> "    cmp     r11, rax":"    setle   al" :"    movzx   rax, al":[]
+    "<"  -> "    cmp     rax, r11":"    setl    al" :"    movzx   rax, al":[]
+    "<=" -> "    cmp     rax, r11":"    setle   al" :"    movzx   rax, al":[]
     _    -> []
 
 push :: Text -> [Text]
 push num =
-  (T.concat ["    push    ", num]):T.empty:[]
+  [ "    push    " <> num
+  , ""]
 
 stackAssign :: (Integral a, Show a) => a -> [Text]
 stackAssign theoffset =
   (genLVal theoffset) ++
-  "    pop     rdi":"    pop     rax":"    mov     [rdi], rax":"    push    rax":"":[]
+  [ "    pop     r11"
+  , "    mov     [rax], r11"
+  , "    push    r11"
+  , ""]
 
 stackLoadLval :: (Integral a, Show a) => a -> [Text]
 stackLoadLval theoffset =
   (genLVal theoffset) ++
-  "    pop     rax":"    mov     rax, [rax]":"    push    rax":"":[]
+  [ "    mov     rax, [rax]"
+  , "    push    rax"
+  , ""]
 
 genLVal :: (Integral a, Show a) => a -> [Text]
-genLVal theoffset = "    mov     rax, rbp":("    sub     rax, " <> (tshow theoffset)):"    push    rax":[]
+genLVal theoffset = [ "    mov     rax, rbp"
+                    , "    sub     rax, " <> tshow theoffset ]
 
 main :: IO ()
 main = do
