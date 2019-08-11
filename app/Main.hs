@@ -98,7 +98,7 @@ pDeclare = pDeclareFunction
 pDeclareFunction :: Parser TopLevel
 pDeclareFunction = do
   funcName            <- identifier
-  args                <- parens $ (Statement <$> pInitialize) `sepBy` comma
+  args                <- parens $ pInitialize `sepBy` comma
   (Branch definition) <- blockStmt
   return DeFun {funcName = funcName, args = args, definition = definition}
 
@@ -118,7 +118,7 @@ blockStmt, simpleStmt, returnStmt, ifStmt, forStmt, whileStmt :: Parser CNode
 
 blockStmt = Branch <$> (try . braces $ many pStatement)
 
-simpleStmt = Statement <$> pExpression <* semicolon
+simpleStmt = pExpression <* semicolon
 
 returnStmt = try $ symbol "return" >> (CtrlStruct . Ret <$> pExpression <* semicolon)
 
@@ -154,7 +154,7 @@ pExpression = choice
 pAssign :: Parser CNode
 pAssign = do
   inits      <- some (try $ pInitialize <* (symbol "="))
-  definition <- option Void ((\(Statement eq) -> eq) <$> pEquality)
+  definition <- option Void pEquality
   return . Branch $ (P.map (\x -> x {mayassign = Just definition}) inits)
 
 pInitialize = (\x -> x {mayassign = Just Void}) <$> pVar
@@ -168,7 +168,7 @@ pEquality = do
   arg0 <- pRelational
   option (arg0) (do eq   <- choice $ (P.map symbol) ["==", "!="]
                     args <- pRelational
-                    return . Statement $ Funcall {funcName = eq, args = [arg0, args]})
+                    return Funcall {funcName = eq, args = [arg0, args]})
 
 pRelational = do
   arg0 <- pAdd
@@ -277,6 +277,7 @@ toplevel2nasm DeFun {funcName = funcName, args = args, definition = definition} 
   push "rbp"
   mov "rbp" "rsp"
   get >>= unwrapEitherS (\s -> matchCommand "-" "rsp" (tshow (maximumDef 0 $ P.map fst (elems $ vars s))))
+  nl
   assign6Args 0 (P.take (P.length args) sysVCallRegs)
   assignRestArgs (P.length sysVCallRegs) (P.drop (P.length sysVCallRegs) args)
   mapM_ cnode2nasm definition
@@ -292,7 +293,7 @@ toplevel2nasm DeFun {funcName = funcName, args = args, definition = definition} 
     assignRestArgs :: (Show a, Integral a) => a -> [b] -> St.State CStateOrError ()
     assignRestArgs _ [] = modify id
     assignRestArgs index (_:xs) = do
-      mov "rax" ("[rbp+" <> tshow (8 * (2 + index - (fromIntegral $ P.length sysVCallRegs))) <> "]")
+      mov "rax" ("qword [rbp+" <> tshow (8 * (2 + index - (fromIntegral $ P.length sysVCallRegs))) <> "]")
       push "rax"
       nl
       stackAssign (8 * (1 + index))
@@ -362,7 +363,7 @@ cnode2nasm Funcall {funcName = funcName, args = args} =
           mapM_ cnode2nasm (P.reverse $ P.drop (P.length sysVCallRegs) args)
           nl
           eitherModify (\s -> s {accm = accm s ++ [ "    call    " <> funcName]})
-          pop "rax"
+          push "rax"
           nl)
   where
     fst6args :: Integral a => a -> [Text] -> St.State CStateOrError ()
@@ -469,13 +470,14 @@ matchCommand func arg0 arg1 = eitherModify $ \s ->
 
 stackAssign :: (Integral a, Show a) => a -> St.State CStateOrError ()
 stackAssign theoffset = do
-  pop "r11"
-  mov ("[rbp-" <> (tshow theoffset) <> "]") "r11"
+  pop "rax"
+  mov ("qword [rbp-" <> (tshow theoffset) <> "]") "rax"
+  push "rax"
   nl
 
 stackLoadLval :: (Integral a, Show a) => a -> St.State CStateOrError ()
 stackLoadLval theoffset = do
-  mov "rax" ("[rbp-" <> (tshow theoffset) <> "]")
+  mov "rax" ("qword [rbp-" <> (tshow theoffset) <> "]")
   push "rax"
   nl
 
@@ -486,18 +488,15 @@ stackLoadLval theoffset = do
 
 push :: Text -> St.State CStateOrError ()
 push num = eitherModify $ \s ->
-  s {accm = accm s ++
-            [ "    push    " <> num ]}
+  s {accm = accm s ++ [ "    push    " <> num ]}
 
 pop :: Text -> St.State CStateOrError ()
 pop num = eitherModify $ \s ->
-  s {accm = accm s ++
-            [ "    pop     " <> num ]}
+  s {accm = accm s ++ [ "    pop     " <> num ]}
 
 mov :: Text -> Text -> St.State CStateOrError ()
 mov dest src = eitherModify $ \s ->
-  s {accm = accm s ++
-            [ "    mov     " <> dest <> ", " <> src]}
+  s {accm = accm s ++ [ "    mov     " <> dest <> ", " <> src]}
 
 nl :: St.State CStateOrError ()
 nl = eitherModify $ \s ->
