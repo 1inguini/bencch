@@ -33,7 +33,7 @@ type Parser = Parsec V.Void Text
 data CNode = Branch [CNode]
            | Statement  CNode
            | CtrlStruct CtrlStruct
-           | CInt      {unwrap :: Int}
+           | CLong      {unwrap :: Integer}
            | Var       {mayassign :: Maybe CNode, var :: Text}
            | Funcall   {funcName :: Text, args :: [CNode]}
            | Void
@@ -111,7 +111,8 @@ pStatement = choice
              , forStmt
              , ifStmt
              , blockStmt
-             , simpleStmt]
+             , simpleStmt
+             ]
 
 blockStmt, simpleStmt, returnStmt, ifStmt, forStmt, whileStmt :: Parser CNode
 
@@ -153,7 +154,7 @@ pExpression = choice
 pAssign :: Parser CNode
 pAssign = do
   inits      <- some (try $ pInitialize <* (symbol "="))
-  definition <- option Void pEquality
+  definition <- option Void ((\(Statement eq) -> eq) <$> pEquality)
   return . Branch $ (P.map (\x -> x {mayassign = Just definition}) inits)
 
 pInitialize = (\x -> x {mayassign = Just Void}) <$> pVar
@@ -167,7 +168,7 @@ pEquality = do
   arg0 <- pRelational
   option (arg0) (do eq   <- choice $ (P.map symbol) ["==", "!="]
                     args <- pRelational
-                    return Funcall {funcName = eq, args = [arg0, args]})
+                    return . Statement $ Funcall {funcName = eq, args = [arg0, args]})
 
 pRelational = do
   arg0 <- pAdd
@@ -187,7 +188,7 @@ pMul = do
                     args <- pUnary
                     return Funcall {funcName = arth, args = [arg0, args]})
 
-pUnary = genpUnary "-" (\x -> Funcall {funcName = (T.singleton '-'), args = [CInt 0, x]}) id pTerm
+pUnary = genpUnary "-" (\x -> Funcall {funcName = (T.singleton '-'), args = [CLong 0, x]}) id pTerm
          <|> genpUnary "+" id id pTerm
   where
     genpUnary :: Text -> (b -> c) -> (b -> c) -> Parser b -> Parser c
@@ -204,7 +205,7 @@ pVar = do
   identifier <- try $ identifier
   return Var {mayassign = Nothing, var = identifier}
 
-pNum = CInt <$> try integer
+pNum = CLong <$> try integer
 
 data CState = CState
             { stnum   :: Integer
@@ -223,6 +224,10 @@ type CStateOrError = Either NasmGenError CState
 
 eitherModify :: (CState -> CState) -> St.State CStateOrError ()
 eitherModify f = modify (fmap f)
+
+unwrapEitherS :: (CState -> St.State CStateOrError ()) -> CStateOrError -> St.State CStateOrError ()
+unwrapEitherS m (Right s)    = m s
+unwrapEitherS _ err@(Left _) = put err
 
 sysVCallRegs :: [Text]
 sysVCallRegs = [ "rdi", "rsi", "rdx", "rcx", "r8", "r9"]
@@ -268,30 +273,30 @@ toplevel2nasm DeFun {funcName = funcName, args = args, definition = definition} 
                          , funcs = funcName:(funcs s)
                          , accm = accm s ++
                                   [ funcName <> ":"
-                                  , "; prologe"
-                                  , "    push    rbp"
-                                  , "    mov     rbp, rsp"
-                                  , "    sub     rsp, " <> tshow (maximumDef 0 $ P.map fst (elems $ vars s)), ""] }
-  assign6Args 8 (P.take (P.length args) sysVCallRegs)
-  assignRestArgs (8 * P.length args) (P.drop (P.length sysVCallRegs) args)
+                                  , "; prologe"] }
+  push "rbp"
+  mov "rbp" "rsp"
+  get >>= unwrapEitherS (\s -> matchCommand "-" "rsp" (tshow (maximumDef 0 $ P.map fst (elems $ vars s))))
+  assign6Args 0 (P.take (P.length args) sysVCallRegs)
+  assignRestArgs (P.length sysVCallRegs) (P.drop (P.length sysVCallRegs) args)
   mapM_ cnode2nasm definition
   where
     assign6Args :: (Show a, Integral a) => a -> [Text] -> St.State CStateOrError ()
     assign6Args _ [] = modify id
-    assign6Args offset (reg:registers) = do
-      eitherModify $ \s -> s { accm = accm s ++
-                                      push reg ++
-                                      stackAssign offset}
-      cnode2nasm $ Statement Void
-      assign6Args (offset + 8) registers
+    assign6Args index (reg:registers) = do
+      eitherModify $ \s -> s { accm = accm s }
+      push reg
+      stackAssign (8 * (index + 1))
+      assign6Args (succ index) registers
 
     assignRestArgs :: (Show a, Integral a) => a -> [b] -> St.State CStateOrError ()
     assignRestArgs _ [] = modify id
-    assignRestArgs offset (_:xs) = do
-      eitherModify $ \s -> s { accm = accm s ++
-                                      stackAssign offset}
-      cnode2nasm $ Statement Void
-      assignRestArgs (offset - 8) xs
+    assignRestArgs index (_:xs) = do
+      mov "rax" ("[rbp+" <> tshow (8 * (2 + index - (fromIntegral $ P.length sysVCallRegs))) <> "]")
+      push "rax"
+      nl
+      stackAssign (8 * (1 + index))
+      assignRestArgs (succ index) xs
 
 genLocals :: CNode -> St.State CStateOrError ()
 genLocals Var {var = var, mayassign = Just _} = do
@@ -307,46 +312,47 @@ genLocals (Statement node) =
   genLocals node
 genLocals _ = modify id
 
-unwrapEitherS :: (CState -> St.State CStateOrError ()) -> CStateOrError -> St.State CStateOrError ()
-unwrapEitherS m (Right s)    = m s
-unwrapEitherS _ err@(Left _) = put err
-
 cnode2nasm :: CNode -> St.State CStateOrError ()
 cnode2nasm (Branch []) = get >>= put
 cnode2nasm (Branch nodeList) =
   mapM_ cnode2nasm nodeList
 cnode2nasm (Statement node) = do
   cnode2nasm node
-  eitherModify (\s -> s { stnum = stnum s + 1
-                        , accm = accm s ++
-                                 [ "; statement end"
-                                 , "    pop     rax"
-                                 , ""]})
-cnode2nasm (CInt num) = eitherModify $ \s ->
-  s {accm = accm s ++ (push . pack . show) num}
+  eitherModify $ \s -> s { stnum = stnum s + 1
+                         , accm = accm s ++ [ "; statement end"]}
+  pop "rax"
+  nl
 
-cnode2nasm Var {var = var, mayassign = Nothing} = modify $ \s -> case s of
-  Right s -> maybe
-             (Left . VariableNotAssigned $ var) (\(offset, _) -> Right s { accm = accm s ++ stackLoadLval offset})
-             $ vars s !? var
-  err     -> err
+cnode2nasm (CLong num) = push (tshow num)
+
+cnode2nasm Var {var = var, mayassign = Nothing} = do
+  s <- get
+  case s of
+    Right s -> maybe
+               (put . Left . VariableNotAssigned $ var) (\(offset, _) -> stackLoadLval offset)
+               $ vars s !? var
+    err     -> put err
 
 cnode2nasm Var {var = var, mayassign = Just value} = do
   cnode2nasm value
-  eitherModify $ \s ->
-    maybe
-    (let newoffset = 8 + (maximumDef 0 $ P.map fst (elems $ vars s)) in
-       s { vars = insert var (newoffset, value) $ vars s
-         , accm = accm s ++ stackAssign newoffset})
-    (\(offset, _) -> s { accm = accm s ++ stackAssign offset })
-    $ vars s !? var
+  get >>= unwrapEitherS
+    (\s ->
+       maybe
+       (let newoffset = 8 + (maximumDef 0 $ P.map fst (elems $ vars s)) in do
+           eitherModify $ \s -> s { vars = insert var (newoffset, value) $ vars s}
+           stackAssign newoffset )
+       (\(offset, _) -> stackAssign offset)
+       $ vars s !? var)
 
 cnode2nasm Funcall {funcName = funcName, args = args} =
   case (funcName `elem` ["+", "-", "*", "/", "==", "!=", ">", ">=", "<", "<="], P.length args) of
     (True, 2) -> do cnode2nasm (atDef Void args 0)
                     cnode2nasm (atDef Void args 1)
-                    eitherModify $ \s -> s { accm = accm s ++ stackExec funcName }
+                    stackExec funcName
+                    nl
+
     (True, _) -> modify $ \_ -> Left UnmatchedArgNum {funcName = funcName, argsgot = args }
+
     (False, _) -> get >>= unwrapEitherS
       (\s -> do
           if funcName `elem` funcs s
@@ -354,8 +360,10 @@ cnode2nasm Funcall {funcName = funcName, args = args} =
             else eitherModify $ \s -> s {externs = funcName:(externs s)}
           fst6args 0 sysVCallRegs
           mapM_ cnode2nasm (P.reverse $ P.drop (P.length sysVCallRegs) args)
-          eitherModify (\s -> s {accm = accm s ++ [ "    call    " <> funcName
-                                                  , "    push    rax",""]}))
+          nl
+          eitherModify (\s -> s {accm = accm s ++ [ "    call    " <> funcName]})
+          pop "rax"
+          nl)
   where
     fst6args :: Integral a => a -> [Text] -> St.State CStateOrError ()
     fst6args 6 _ = modify id
@@ -371,9 +379,9 @@ cnode2nasm (CtrlStruct (If {cond = cond, stmt = stmt, elst = Void})) =
   get >>= unwrapEitherS (\s ->
   let lxxx = (tshow . stnum) s in do
     cnode2nasm cond
+    pop "rax"
     eitherModify $ \s -> s {accm = accm s ++
-                             [ "    pop     rax"
-                             , "    cmp     rax, 0"
+                             [ "    cmp     rax, 0"
                              , "    je      Lend" <> lxxx,""]}
     cnode2nasm stmt
     eitherModify $ \s -> s {accm = accm s ++ ["Lend" <> lxxx <> ":"]})
@@ -382,9 +390,9 @@ cnode2nasm (CtrlStruct (If {cond = cond, stmt = stmt, elst = elst})) =
   get >>= unwrapEitherS (\s ->
   let lxxx = (tshow . stnum) s in do
     cnode2nasm cond
+    pop "rax"
     eitherModify $ \s -> s {accm = accm s ++
-                             [ "    pop     rax"
-                             , "    cmp     rax, 0"
+                             [ "    cmp     rax, 0"
                              , "    je      Lelse" <> lxxx, ""]}
     cnode2nasm stmt
     eitherModify $ \s -> s {accm = accm s ++
@@ -398,9 +406,9 @@ cnode2nasm (CtrlStruct (Whl {cond = cond, stmt = stmt})) =
   (\s -> let lxxx = (tshow . stnum) s in do
       eitherModify $ \s -> s {accm = accm s ++ ("Lbegin" <> lxxx <> ":"):[]}
       cnode2nasm cond
+      pop "rax"
       eitherModify $ \s -> s {accm = accm s ++
-                                  [ "    pop     rax"
-                                  , "    cmp     rax, 0"
+                                  [ "    cmp     rax, 0"
                                   , "    je      Lend" <> lxxx, ""]}
       cnode2nasm stmt
       eitherModify $ \s -> s {accm = accm s ++
@@ -413,9 +421,9 @@ cnode2nasm (CtrlStruct (For {init = init, cond = cond, finexpr = finexpr, stmt =
       cnode2nasm init
       eitherModify $ \s -> s {accm = accm s ++ ["Lbegin" <> lxxx <> ":"]}
       cnode2nasm cond
+      pop "rax"
       eitherModify $ \s -> s {accm = accm s ++
-                                  [ "    pop     rax"
-                                  , "    cmp     rax, 0"
+                                  [ "    cmp     rax, 0"
                                   , "    je      Lend" <> lxxx, ""]}
       cnode2nasm stmt
       cnode2nasm finexpr
@@ -425,59 +433,75 @@ cnode2nasm (CtrlStruct (For {init = init, cond = cond, finexpr = finexpr, stmt =
 
 cnode2nasm (CtrlStruct (Ret node)) = do
   cnode2nasm node
-  eitherModify $ \s -> s {accm = accm s ++
-                                 ["; epiloge"
-                                 , ""
-                                 , "    pop     rax"
-                                 , "    mov     rsp, rbp"
-                                 , "    pop     rbp"
-                                 , "    ret", ""]}
+  eitherModify $ \s -> s {accm = accm s ++ ["; epiloge"]}
+  pop "rax"
+  mov "rsp" "rbp"
+  pop "rbp"
+  eitherModify $ \s -> s {accm = accm s ++ ["    ret"]}
+  nl
 
 cnode2nasm EOF = get >>= put
 cnode2nasm Void = get >>= put
 
-stackExec :: Text -> [Text]
-stackExec func =
-  "    pop     r11":"    pop     rax":matchCommand func ++ "    push    rax":"":[]
+stackExec :: Text -> St.State CStateOrError ()
+stackExec func = do
+  pop "r11"
+  pop "rax"
+  matchCommand func "rax" "r11"
+  push "rax"
+  nl
 
-matchCommand :: Text -> [Text]
-matchCommand func =
-  case func of
-    "+"  -> "    add     rax, r11":[]
-    "-"  -> "    sub     rax, r11":[]
-    "*"  -> "    imul    r11"     :[]
-    "/"  -> "    idiv    r11"     :[]
-    "==" -> "    cmp     rax, r11":"    sete    al" :"    movzx   rax, al":[]
-    "!=" -> "    cmp     rax, r11":"    setne   al" :"    movzx   rax, al":[]
-    ">"  -> "    cmp     r11, rax":"    setl    al" :"    movzx   rax, al":[]
-    ">=" -> "    cmp     r11, rax":"    setle   al" :"    movzx   rax, al":[]
-    "<"  -> "    cmp     rax, r11":"    setl    al" :"    movzx   rax, al":[]
-    "<=" -> "    cmp     rax, r11":"    setle   al" :"    movzx   rax, al":[]
-    _    -> []
+matchCommand :: Text -> Text -> Text -> St.State CStateOrError ()
+matchCommand func arg0 arg1 = eitherModify $ \s ->
+  s {accm = accm s ++
+            case func of
+              "+"  -> [ "    add     " <> arg0 <> ", " <> arg1 ]
+              "-"  -> [ "    sub     " <> arg0 <> ", " <> arg1 ]
+              "*"  -> [ "    mov     rax, " <> arg0, "    imul    " <> arg1 ]
+              "/"  -> [ "    mov     rax, " <> arg0, "    idiv    " <> arg1 ]
+              "==" -> [ "    cmp     " <> arg0 <> ", " <> arg1, "    sete    al" , "    movzx   rax, al" ]
+              "!=" -> [ "    cmp     " <> arg0 <> ", " <> arg1, "    setne   al" , "    movzx   rax, al" ]
+              ">"  -> [ "    cmp     " <> arg1 <> ", " <> arg0, "    setl    al" , "    movzx   rax, al" ]
+              ">=" -> [ "    cmp     " <> arg1 <> ", " <> arg0, "    setle   al" , "    movzx   rax, al" ]
+              "<"  -> [ "    cmp     " <> arg0 <> ", " <> arg1, "    setl    al" , "    movzx   rax, al" ]
+              "<=" -> [ "    cmp     " <> arg0 <> ", " <> arg1, "    setle   al" , "    movzx   rax, al" ]
+              _    -> []}
 
-push :: Text -> [Text]
-push num =
-  [ "    push    " <> num
-  , ""]
+stackAssign :: (Integral a, Show a) => a -> St.State CStateOrError ()
+stackAssign theoffset = do
+  pop "r11"
+  mov ("[rbp-" <> (tshow theoffset) <> "]") "r11"
+  nl
 
-stackAssign :: (Integral a, Show a) => a -> [Text]
-stackAssign theoffset =
-  (genLVal theoffset) ++
-  [ "    pop     r11"
-  , "    mov     [rax], r11"
-  , "    push    r11"
-  , ""]
+stackLoadLval :: (Integral a, Show a) => a -> St.State CStateOrError ()
+stackLoadLval theoffset = do
+  mov "rax" ("[rbp-" <> (tshow theoffset) <> "]")
+  push "rax"
+  nl
 
-stackLoadLval :: (Integral a, Show a) => a -> [Text]
-stackLoadLval theoffset =
-  (genLVal theoffset) ++
-  [ "    mov     rax, [rax]"
-  , "    push    rax"
-  , ""]
+-- genLVal :: (Integral a, Show a) => a -> St.State CStateOrError ()
+-- genLVal theoffset = do
+--   mov "rax" "rbp"
+--   matchCommand "-" "rax" (tshow theoffset)
 
-genLVal :: (Integral a, Show a) => a -> [Text]
-genLVal theoffset = [ "    mov     rax, rbp"
-                    , "    sub     rax, " <> tshow theoffset ]
+push :: Text -> St.State CStateOrError ()
+push num = eitherModify $ \s ->
+  s {accm = accm s ++
+            [ "    push    " <> num ]}
+
+pop :: Text -> St.State CStateOrError ()
+pop num = eitherModify $ \s ->
+  s {accm = accm s ++
+            [ "    pop     " <> num ]}
+
+mov :: Text -> Text -> St.State CStateOrError ()
+mov dest src = eitherModify $ \s ->
+  s {accm = accm s ++
+            [ "    mov     " <> dest <> ", " <> src]}
+
+nl :: St.State CStateOrError ()
+nl = eitherModify $ \s ->
+  s {accm = accm s ++ [""]}
 
 main :: IO ()
 main = do
