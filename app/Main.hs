@@ -166,25 +166,25 @@ pFuncall = try $ do
 pEquality = do
   arg0 <- pRelational
   option (arg0) (do eq   <- choice $ (P.map symbol) ["==", "!="]
-                    args <- pRelational
+                    args <- pExpression
                     return Funcall {funcName = eq, args = [arg0, args]})
 
 pRelational = do
   arg0 <- pAdd
   option (arg0) (do comp <- choice $ (P.map symbol) ["<=", ">=", ">", "<"]
-                    args <- pAdd
+                    args <- pExpression
                     return Funcall {funcName = comp, args = [arg0, args]})
 
 pAdd = do
   arg0 <- pMul
   option (arg0) (do arth <- choice $ (P.map symbol) ["+", "-"]
-                    args <- pMul
+                    args <- pExpression
                     return Funcall {funcName = arth, args = [arg0, args]})
 
 pMul = do
   arg0 <- pUnary
   option (arg0) (do arth <- choice $ (P.map symbol) ["*", "/"]
-                    args <- pUnary
+                    args <- pExpression
                     return Funcall {funcName = arth, args = [arg0, args]})
 
 pUnary = genpUnary "-" (\x -> Funcall {funcName = (T.singleton '-'), args = [CLong 0, x]}) id pTerm
@@ -289,15 +289,15 @@ toplevel2nasm DeFun {funcName = funcName, args = args, definition = definition} 
       eitherModify $ \s -> s { accm = accm s }
       push reg
       stackAssign (8 * (index + 1))
+      cnode2nasm $ Expression Void
       assign6Args (succ index) registers
 
     assignRestArgs :: (Show a, Integral a) => a -> [b] -> St.State CStateOrError ()
     assignRestArgs _ [] = modify id
     assignRestArgs index (_:xs) = do
-      mov "rax" ("qword [rbp+" <> tshow (8 * (2 + index - (fromIntegral $ P.length sysVCallRegs))) <> "]")
-      push "rax"
-      nl
+      push ("[rbp+" <> tshow (8 * (2 + index - (fromIntegral $ P.length sysVCallRegs))) <> "]")
       stackAssign (8 * (1 + index))
+      cnode2nasm $ Expression Void
       assignRestArgs (succ index) xs
 
 genLocals :: CNode -> St.State CStateOrError ()
@@ -484,14 +484,13 @@ matchCommand func arg0 arg1 = eitherModify $ \s ->
 
 stackAssign :: (Integral a, Show a) => a -> St.State CStateOrError ()
 stackAssign theoffset = do
-  pop "rax"
-  mov ("qword [rbp-" <> (tshow theoffset) <> "]") "rax"
-  push "rax"
+  pop ("[rbp-" <> (tshow theoffset) <> "]")
+  push ("[rbp-" <> (tshow theoffset) <> "]")
   nl
 
 stackLoadLval :: (Integral a, Show a) => a -> St.State CStateOrError ()
 stackLoadLval theoffset = do
-  push ("qword [rbp-" <> (tshow theoffset) <> "]")
+  push ("[rbp-" <> (tshow theoffset) <> "]")
   nl
 
 -- genLVal :: (Integral a, Show a) => a -> St.State CStateOrError ()
@@ -501,15 +500,15 @@ stackLoadLval theoffset = do
 
 push :: Text -> St.State CStateOrError ()
 push num = eitherModify $ \s ->
-  s {accm = accm s ++ [ "    push    " <> num ]}
+  s {accm = accm s ++ [ "    push    qword " <> num ]}
 
 pop :: Text -> St.State CStateOrError ()
 pop num = eitherModify $ \s ->
-  s {accm = accm s ++ [ "    pop     " <> num ]}
+  s {accm = accm s ++ [ "    pop     qword " <> num ]}
 
 mov :: Text -> Text -> St.State CStateOrError ()
 mov dest src = eitherModify $ \s ->
-  s {accm = accm s ++ [ "    mov     " <> dest <> ", " <> src]}
+  s {accm = accm s ++ [ "    mov     " <> dest <> ", qword " <> src]}
 
 nl :: St.State CStateOrError ()
 nl = eitherModify $ \s ->
