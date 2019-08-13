@@ -374,13 +374,9 @@ cnode2nasm Funcall {funcName = funcName, args = args} =
   case ( funcName `elem`  biops
        , funcName `elem` unarys
        , P.length args) of
-    (True, _, 2) -> do cnode2nasm (atDef Void args 0)
-                       cnode2nasm (atDef Void args 1)
-                       stackExec funcName
-                       nl
+    (True, _, 2) -> stackExec funcName (atDef Void args 0) (atDef Void args 1)
 
-    (_, True, 1) -> do stackUnary funcName (atDef Void args 0)
-                       nl
+    (_, True, 1) -> stackUnary funcName (atDef Void args 0)
 
     (True, _, _) -> modify $ \_ -> Left UnmatchedArgNum {funcName = funcName, argsgot = args }
     (_, True, _) -> modify $ \_ -> Left UnmatchedArgNum {funcName = funcName, argsgot = args }
@@ -476,8 +472,10 @@ cnode2nasm (CtrlStruct (Ret node)) = do
 cnode2nasm EOF = get >>= put
 cnode2nasm Void = get >>= put
 
-stackExec :: Text -> St.State CStateOrError ()
-stackExec func = do
+stackExec :: Text -> CNode -> CNode -> St.State CStateOrError ()
+stackExec func arg0 arg1 = do
+  cnode2nasm arg0
+  cnode2nasm arg1
   pop "r11"
   pop "rax"
   matchCommand func "rax" "r11"
