@@ -187,14 +187,14 @@ pMul = do
                     args <- pExpression
                     return Funcall {funcName = arth, args = [arg0, args]})
 
-pUnary = genpUnary "-" (\x -> Funcall {funcName = (T.singleton '-'), args = [CLong 0, x]}) id pTerm
-         <|> genpUnary "+" id id pTerm
-         <|> pTerm
+pUnary = choice $ P.map genpUnary unarys ++ [pTerm]
   where
-    genpUnary :: Text -> (b -> c) -> (b -> c) -> Parser b -> Parser c
-    genpUnary sym op0 op1 parg =
-      (op0 <$> (try $ symbol sym >> parg))
-      <|> op1 <$> parg
+    genpUnary :: Text -> Parser CNode
+    genpUnary sym =
+      (\x -> Funcall {funcName = sym, args = [x]}) <$> (try $ symbol sym >> pTerm)
+
+unarys :: [Text]
+unarys = ["+", "-", "*", "&"]
 
 pTerm = choice
         [ pFuncall
@@ -232,6 +232,19 @@ unwrapEitherS _ err@(Left _) = put err
 
 sysVCallRegs :: [Text]
 sysVCallRegs = [ "rdi", "rsi", "rdx", "rcx", "r8", "r9"]
+
+biops :: [Text]
+biops = ["+", "-", "*", "/", "==", "!=", ">", ">=", "<", "<="]
+
+assignVar var val =
+  get >>= unwrapEitherS
+    (\s ->
+       maybe
+       (let newoffset = 8 + (maximumDef 0 $ P.map fst (elems $ vars s)) in do
+           eitherModify $ \s -> s { vars = insert var (newoffset, val) $ vars s}
+           stackAssign newoffset)
+       (\(offset, _) -> stackAssign offset)
+       $ vars s !? var)
 
 program2nasm :: [TopLevel] -> [Text]
 program2nasm tops =
@@ -353,21 +366,26 @@ cnode2nasm Var {var = var, mayassign = Just value} = do
        maybe
        (let newoffset = 8 + (maximumDef 0 $ P.map fst (elems $ vars s)) in do
            eitherModify $ \s -> s { vars = insert var (newoffset, value) $ vars s}
-           stackAssign newoffset
-           push "rax")
+           stackAssign newoffset)
        (\(offset, _) -> stackAssign offset)
        $ vars s !? var)
 
 cnode2nasm Funcall {funcName = funcName, args = args} =
-  case (funcName `elem` ["+", "-", "*", "/", "==", "!=", ">", ">=", "<", "<="], P.length args) of
-    (True, 2) -> do cnode2nasm (atDef Void args 0)
-                    cnode2nasm (atDef Void args 1)
-                    stackExec funcName
-                    nl
+  case ( funcName `elem`  biops
+       , funcName `elem` unarys
+       , P.length args) of
+    (True, _, 2) -> do cnode2nasm (atDef Void args 0)
+                       cnode2nasm (atDef Void args 1)
+                       stackExec funcName
+                       nl
 
-    (True, _) -> modify $ \_ -> Left UnmatchedArgNum {funcName = funcName, argsgot = args }
+    (_, True, 1) -> do stackUnary funcName (atDef Void args 0)
+                       nl
 
-    (False, _) -> get >>= unwrapEitherS
+    (True, _, _) -> modify $ \_ -> Left UnmatchedArgNum {funcName = funcName, argsgot = args }
+    (_, True, _) -> modify $ \_ -> Left UnmatchedArgNum {funcName = funcName, argsgot = args }
+
+    (False, _, _) -> get >>= unwrapEitherS
       (\s -> do
           if funcName `elem` funcs s
             then modify id
@@ -467,20 +485,43 @@ stackExec func = do
   nl
 
 matchCommand :: Text -> Text -> Text -> St.State CStateOrError ()
-matchCommand func arg0 arg1 = eitherModify $ \s ->
-  s {accm = accm s ++
+matchCommand func arg0 arg1 = do
+  eitherModify $ \s ->
+    s {accm = accm s ++
+              case func of
+                "+"  -> [ "    add     " <> arg0 <> ", " <> arg1 ]
+                "-"  -> [ "    sub     " <> arg0 <> ", " <> arg1 ]
+                "*"  -> [ "    mov     rax, " <> arg0, "    imul    " <> arg1 ]
+                "/"  -> [ "    mov     rax, " <> arg0, "    idiv    " <> arg1 ]
+                "==" -> [ "    cmp     " <> arg0 <> ", " <> arg1, "    sete    al" , "    movzx   rax, al" ]
+                "!=" -> [ "    cmp     " <> arg0 <> ", " <> arg1, "    setne   al" , "    movzx   rax, al" ]
+                ">"  -> [ "    cmp     " <> arg1 <> ", " <> arg0, "    setl    al" , "    movzx   rax, al" ]
+                ">=" -> [ "    cmp     " <> arg1 <> ", " <> arg0, "    setle   al" , "    movzx   rax, al" ]
+                "<"  -> [ "    cmp     " <> arg0 <> ", " <> arg1, "    setl    al" , "    movzx   rax, al" ]
+                "<=" -> [ "    cmp     " <> arg0 <> ", " <> arg1, "    setle   al" , "    movzx   rax, al" ]
+                _    -> []}
+
+stackUnary :: Text -> CNode -> St.State CStateOrError ()
+stackUnary func arg =
             case func of
-              "+"  -> [ "    add     " <> arg0 <> ", " <> arg1 ]
-              "-"  -> [ "    sub     " <> arg0 <> ", " <> arg1 ]
-              "*"  -> [ "    mov     rax, " <> arg0, "    imul    " <> arg1 ]
-              "/"  -> [ "    mov     rax, " <> arg0, "    idiv    " <> arg1 ]
-              "==" -> [ "    cmp     " <> arg0 <> ", " <> arg1, "    sete    al" , "    movzx   rax, al" ]
-              "!=" -> [ "    cmp     " <> arg0 <> ", " <> arg1, "    setne   al" , "    movzx   rax, al" ]
-              ">"  -> [ "    cmp     " <> arg1 <> ", " <> arg0, "    setl    al" , "    movzx   rax, al" ]
-              ">=" -> [ "    cmp     " <> arg1 <> ", " <> arg0, "    setle   al" , "    movzx   rax, al" ]
-              "<"  -> [ "    cmp     " <> arg0 <> ", " <> arg1, "    setl    al" , "    movzx   rax, al" ]
-              "<=" -> [ "    cmp     " <> arg0 <> ", " <> arg1, "    setle   al" , "    movzx   rax, al" ]
-              _    -> []}
+              "+" -> modify id
+              "-" -> cnode2nasm arg >> pop "rax" >> nasmNeg "rax" >> push "rax"
+              "*" -> cnode2nasm arg >> pop "rax" >> push "[rax]"
+              "&" -> do s <- get
+                        case (arg, s) of
+                          (Var {var = var}, Right s) -> maybe
+                                                        (put . Left . VariableNotAssigned $ var)
+                                                        (\(offset, _) -> do mov "rax" "rbp"
+                                                                            matchCommand "-" "rax" (tshow offset)
+                                                                            push "rax")
+                                                        $ vars s !? var
+                          (var, Right s)             -> (put . Left . VariableNotAssigned $ tshow var)
+                          (_, err@(Left _))          -> put err
+              _   -> modify id
+            >> nl
+
+nasmNeg :: Text -> St.State CStateOrError ()
+nasmNeg arg = eitherModify $ \s -> s {accm = accm s ++  [ "    neg     " <> arg ]}
 
 stackAssign :: (Integral a, Show a) => a -> St.State CStateOrError ()
 stackAssign theoffset = do
