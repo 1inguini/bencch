@@ -30,9 +30,10 @@ type Parser = Parsec V.Void Text
 data CNode = Branch [CNode]
            | Expression  CNode
            | CtrlStruct CtrlStruct
-           | CLong      {unwrap :: Integer}
-           | Var       {mayassign :: Maybe CNode, var :: Text}
-           | Funcall   {funcName :: Text, args :: [CNode]}
+           | CLong   {unwrap :: Integer}
+           | DefVar  {var :: Text}
+           | Var     {mayassign :: Maybe CNode, var :: Text}
+           | Funcall {funcName :: Text, args :: [CNode]}
            | Void
            | EOF
            deriving  (Show, Eq)
@@ -145,18 +146,19 @@ whileStmt = do
   return $ CtrlStruct Whl {cond = cond, stmt = stmt}
 
 pExpression = choice
-              [ pAssign
+              [ pInitialize
+              , pAssign
               , pEquality
               ]
 
 
 pAssign :: Parser CNode
 pAssign = do
-  init       <- try $ pInitialize <* symbol "="
+  init       <- try $ pVar <* symbol "="
   definition <- option Void pExpression
   return init {mayassign = Just definition}
 
-pInitialize = (\x -> x {mayassign = Just Void}) <$> pVar
+pInitialize = (\x -> DefVar {var = x}) <$> (symbol "long" >> identifier)
 
 pFuncall = try $ do
   func <- identifier
@@ -187,14 +189,21 @@ pMul = do
                     args <- pExpression
                     return Funcall {funcName = arth, args = [arg0, args]})
 
-pUnary = choice $ P.map genpUnary unarys ++ [pTerm]
+pUnary = choice $ (P.map genpUnary unarysAndParsers) ++ [pTerm]
   where
-    genpUnary :: Text -> Parser CNode
-    genpUnary sym =
-      (\x -> Funcall {funcName = sym, args = [x]}) <$> (try $ symbol sym >> pTerm)
+    genpUnary :: (Text, Parser CNode) -> Parser CNode
+    genpUnary (sym, parser) =
+      (\x -> Funcall {funcName = sym, args = [x]}) <$> (try $ symbol sym >> parser)
 
 unarys :: [Text]
-unarys = ["+", "-", "*", "&"]
+unarys = P.map fst unarysAndParsers
+
+unarysAndParsers :: [(Text, Parser CNode)]
+unarysAndParsers = [ ("+", pTerm)
+                   , ("-", pTerm)
+                   , ("*", pUnary)
+                   , ("&", pUnary)
+                   ]
 
 pTerm = choice
         [ pFuncall
@@ -217,7 +226,8 @@ data CState = CState
             , defName :: Text
             } deriving (Show, Eq)
 
-data NasmGenError = VariableNotAssigned Text
+data NasmGenError = VariableNotDefined Text
+                  | MultipleDeclaration Text
                   | UnmatchedArgNum     {funcName :: Text, argsgot :: [CNode]}
                   deriving (Show, Eq)
 
@@ -235,16 +245,6 @@ sysVCallRegs = [ "rdi", "rsi", "rdx", "rcx", "r8", "r9"]
 
 biops :: [Text]
 biops = ["+", "-", "*", "/", "==", "!=", ">", ">=", "<", "<="]
-
-assignVar var val =
-  get >>= unwrapEitherS
-    (\s ->
-       maybe
-       (let newoffset = 8 + (maximumDef 0 $ P.map fst (elems $ vars s)) in do
-           eitherModify $ \s -> s { vars = insert var (newoffset, val) $ vars s}
-           stackAssign newoffset)
-       (\(offset, _) -> stackAssign offset)
-       $ vars s !? var)
 
 program2nasm :: [TopLevel] -> [Text]
 program2nasm tops =
@@ -290,7 +290,8 @@ toplevel2nasm DeFun {funcName = funcName, args = args, definition = definition} 
                                   , "; prologe"] }
   push "rbp"
   mov "rbp" "rsp"
-  get >>= unwrapEitherS (\s -> matchCommand "-" "rsp" (tshow (maximumDef 0 $ P.map fst (elems $ vars s))))
+  get >>= unwrapEitherS (\s -> do matchCommand "-" "rsp" (tshow (maximumDef 0 $ P.map fst (elems $ vars s)))
+                                  eitherModify $ \s -> s {vars = Map.empty})
   nl
   assign6Args 0 (P.take (P.length args) sysVCallRegs)
   assignRestArgs (P.length sysVCallRegs) (P.drop (P.length sysVCallRegs) args)
@@ -314,13 +315,15 @@ toplevel2nasm DeFun {funcName = funcName, args = args, definition = definition} 
       assignRestArgs (succ index) xs
 
 genLocals :: CNode -> St.State CStateOrError ()
-genLocals Var {var = var, mayassign = Just _} = do
-      eitherModify $ \s ->
-          maybe
-          (let newoffset = 8 + (maximumDef 0 $ P.map fst (elems $ vars s)) in
-              s { vars = insert var (newoffset, Void) (vars s)})
-          (\_ -> s)
-          $ vars s !? var
+genLocals DefVar {var = var} = do
+  get >>= unwrapEitherS
+    (\s ->
+       maybe
+       (let newoffset = 8 + (maximumDef 0 $ P.map fst (elems $ vars s)) in do
+           eitherModify $ \s -> s { vars = insert var (newoffset, Void) $ vars s})
+       (\_ -> put . Left . MultipleDeclaration $ var)
+       $ vars s !? var)
+
 genLocals (Branch []) = modify id
 genLocals (Branch nodeList) =
   mapM_ genLocals nodeList
@@ -329,7 +332,7 @@ genLocals (Expression node) =
 genLocals (CtrlStruct (If {cond = cond, stmt = stmt, elst = Void})) =
   mapM_ genLocals [cond, stmt]
 genLocals (CtrlStruct (If {cond = cond, stmt = stmt, elst = elst})) =
-  mapM_ genLocals [cond, stmt]
+  mapM_ genLocals [cond, stmt, elst]
 genLocals (CtrlStruct (Whl {cond = cond, stmt = stmt})) =
   mapM_ genLocals [cond, stmt]
 genLocals (CtrlStruct (For {init = init, cond = cond, finexpr = finexpr, stmt = stmt})) =
@@ -351,24 +354,35 @@ cnode2nasm (Expression node) = do
 
 cnode2nasm (CLong num) = push (tshow num)
 
+cnode2nasm DefVar {var = var} = do
+  get >>= unwrapEitherS
+    (\s ->
+       maybe
+       (let newoffset = 8 + (maximumDef 0 $ P.map fst (elems $ vars s)) in do
+           push "0"
+           stackAssign newoffset
+           eitherModify $ \s -> s { vars = insert var (newoffset, Void) $ vars s})
+       (\_ -> put . Left . MultipleDeclaration $ var)
+       $ vars s !? var)
+
 cnode2nasm Var {var = var, mayassign = Nothing} = do
   s <- get
   case s of
     Right s -> maybe
-               (put . Left . VariableNotAssigned $ var) (\(offset, _) -> stackLoadLval offset)
+               (put . Left . VariableNotDefined $ var)
+               (\(offset, _) -> stackLoadLval offset)
                $ vars s !? var
     err     -> put err
 
 cnode2nasm Var {var = var, mayassign = Just value} = do
   cnode2nasm value
-  get >>= unwrapEitherS
-    (\s ->
-       maybe
-       (let newoffset = 8 + (maximumDef 0 $ P.map fst (elems $ vars s)) in do
-           eitherModify $ \s -> s { vars = insert var (newoffset, value) $ vars s}
-           stackAssign newoffset)
-       (\(offset, _) -> stackAssign offset)
-       $ vars s !? var)
+  s <- get
+  case s of
+    Right s -> maybe
+               (put . Left . VariableNotDefined $ var)
+               (\(offset, _) -> stackAssign offset)
+               $ vars s !? var
+    err     -> put err
 
 cnode2nasm Funcall {funcName = funcName, args = args} =
   case ( funcName `elem`  biops
@@ -508,12 +522,12 @@ stackUnary func arg =
               "&" -> do s <- get
                         case (arg, s) of
                           (Var {var = var}, Right s) -> maybe
-                                                        (put . Left . VariableNotAssigned $ var)
+                                                        (put . Left . VariableNotDefined $ var)
                                                         (\(offset, _) -> do mov "rax" "rbp"
                                                                             matchCommand "-" "rax" (tshow offset)
                                                                             push "rax")
                                                         $ vars s !? var
-                          (var, Right s)             -> (put . Left . VariableNotAssigned $ tshow var)
+                          (var, Right s)             -> (put . Left . VariableNotDefined $ tshow var)
                           (_, err@(Left _))          -> put err
               _   -> modify id
             >> nl
