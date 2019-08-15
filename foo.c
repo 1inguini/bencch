@@ -16,3 +16,14 @@ long bar(long a0, long a1, long a2, long a3, long a4, long a5, long a6, long a7,
         a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, b0, b1, b2, b3, b4, b5, b6, b7,
         b8, b9, sum);
 }
+
+long show_long(long num) {
+    printf("%ld\n", num);
+    return num;
+}
+
+int main() {
+    long x;
+    for (x = 0; x < 100000000000000; x = x + 1) show_long(x);
+    return 0;
+}

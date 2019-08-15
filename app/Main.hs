@@ -53,7 +53,7 @@ data CType = CLong
            | Unknown
            deriving  (Show, Eq)
 
-data TopLevel = DeFun { funcName :: Text, args :: [CNode], definition :: [CNode] }
+data TopLevel = DeFun { ctype :: CType, funcName :: Text, args :: [CNode], definition :: [CNode] }
               deriving  (Show, Eq)
 
 type Offset = Integer
@@ -112,17 +112,21 @@ pDeclare = pDeclareFunction
 
 pDeclareFunction :: Parser TopLevel
 pDeclareFunction = do
+  ctypeName           <- spaceConsumer >> many letterChar
   funcName            <- identifier
   args                <- parens $ pDefVar `sepBy` comma
   (Branch definition) <- blockStmt
-  return DeFun {funcName = funcName, args = args, definition = definition}
+  return DeFun { ctype = case ctypeName of
+                           "long" -> CLong
+                           _      -> Unknown
+               , funcName = funcName, args = args, definition = definition}
 
-pStatement, pExpression, pDefVar, pLoadVar, pEquality, pRelational, pAdd, pMul, pTerm, pLong, pUnary, pFuncall
+pStatement, pExpression, pDefVar, pDefLong, pLoadVar, pEquality, pRelational, pAdd, pMul, pTerm, pLong, pUnary, pFuncall
   :: Parser CNode
 
 pStatement = choice
              [ returnStmt
-             , pDefVar
+             , defStmt
              , whileStmt
              , forStmt
              , ifStmt
@@ -133,33 +137,35 @@ pStatement = choice
 reserved :: [Text]
 reserved = ["return", "long", "while", "for", "if", "else"]
 
-returnStmt, pDefLong, whileStmt, forStmt, ifStmt, blockStmt, simpleStmt :: Parser CNode
+returnStmt, defStmt, whileStmt, forStmt, ifStmt, blockStmt, simpleStmt :: Parser CNode
 
 returnStmt = symbol "return" >> CtrlStruct . Ret <$> simpleStmt
+
+defStmt = pDefVar <* semicolon
 
 pDefVar = pDefLong
 
 pDefLong = symbol "long" >>
            DefVar
            <$> pPtrTo CLong
-           <*> identifier <* semicolon
+           <*> identifier
 
 pPtrTo :: CType -> Parser CType
 pPtrTo ctype = choice [ symbol "*" >> Ptr <$> pPtrTo ctype
                       , return ctype]
 
 whileStmt = do
-  cond <- symbol "while" >> parens pEquality
+  cond <- symbol "while" >> parens (Expression <$> pEquality)
   stmt <- pStatement
   return $ CtrlStruct Whl {cond = cond, stmt = stmt}
 
 forStmt = do
   init <- symbol "for" >>
-          parens (do init    <- option Void pAssign
+          parens (do init    <- option Void (Expression <$> pAssign)
                      _       <- semicolon
-                     cond    <- option Void pEquality
+                     cond    <- option Void (Expression <$> pEquality)
                      _       <- semicolon
-                     finexpr <- option Void pAssign
+                     finexpr <- option Void (Expression <$> pAssign)
                      return For { init    = init
                                 , cond    = cond
                                 , finexpr = finexpr
@@ -168,7 +174,7 @@ forStmt = do
   return $ CtrlStruct init { stmt = stmt }
 
 ifStmt = do
-  cond <- symbol "if" >> parens pEquality
+  cond <- symbol "if" >> parens (Expression <$> pEquality)
   stmt <- pStatement
   elst <- option Void (symbol "else" >> pStatement)
   return $ CtrlStruct If { cond = cond, stmt = stmt, elst = elst }
@@ -320,7 +326,6 @@ program2nasm tops =
 toplevel2nasm :: TopLevel -> St.State CStateOrError ()
 toplevel2nasm DeFun {funcName = funcName, args = args, definition = definition} = do
   eitherModify $ \s -> s { vars = Map.empty }
-  mapM_ genLocals (args ++ definition)
   eitherModify $ \s -> s { defName = funcName
                          , funcs = funcName:(funcs s)
                          }
@@ -328,9 +333,11 @@ toplevel2nasm DeFun {funcName = funcName, args = args, definition = definition} 
              , "; prologe"]
   push "rbp"
   mov "rbp" "rsp"
+  mapM_ genLocals (args ++ definition)
   unwrapGet $ \s -> do matchCommand "-" "rsp" (tshow (maximumDef 0 $ snd <$> (elems $ vars s)))
                        eitherModify $ \s -> s {vars = Map.empty}
   nl
+  mapM_ genLocals (args ++ definition)
   assign6Args 0 (P.take (P.length args) sysVCallRegs)
   assignRestArgs (P.length sysVCallRegs) (P.drop (P.length sysVCallRegs) args)
   mapM_ cnode2nasm definition
@@ -338,7 +345,6 @@ toplevel2nasm DeFun {funcName = funcName, args = args, definition = definition} 
     assign6Args :: (Show a, Integral a) => a -> [Text] -> St.State CStateOrError ()
     assign6Args _ [] = modify id
     assign6Args index (reg:registers) = do
-      eitherModify $ \s -> s { accm = accm s }
       push reg
       stackAssign (8 * (index + 1))
       cnode2nasm $ Expression Void
@@ -406,7 +412,8 @@ cnode2nasm n@DefVar {defType = ctype, varName = varName} = do
            eitherModify $ \s -> s { vars = insert varName (ctype, newoffset) $ vars s}
            appendAccm [ "    ; " <> tshow n ]
            nl)
-       (\_ -> throwNasmGenError n $ MultipleDeclaration varName)
+       (\_ -> modify id -- throwNasmGenError n $ MultipleDeclaration varName
+       )
        $ vars s !? varName)
 
 cnode2nasm n@AssignVar {var = PtrTo cnode, val = val} =  do
@@ -479,7 +486,7 @@ cnode2nasm (CtrlStruct (If {cond = cond, stmt = stmt, elst = Void})) =
   unwrapGet $ \s ->
   let lxxx = (tshow . stnum) s in do
     cnode2nasm cond
-    pop "rax"
+    -- pop "rax"
     appendAccm [ "    cmp     rax, 0"
                , "    je      Lend" <> lxxx
                ,""]
@@ -490,7 +497,7 @@ cnode2nasm (CtrlStruct (If {cond = cond, stmt = stmt, elst = elst})) =
   unwrapGet $ \s ->
   let lxxx = (tshow . stnum) s in do
     cnode2nasm cond
-    pop "rax"
+    -- pop "rax"
     appendAccm [ "    cmp     rax, 0"
                , "    je      Lelse" <> lxxx ]
     nl
@@ -505,7 +512,7 @@ cnode2nasm (CtrlStruct (Whl {cond = cond, stmt = stmt})) =
   let lxxx = (tshow . stnum) s in do
     eitherModify $ \s -> s {accm = accm s ++ ("Lbegin" <> lxxx <> ":"):[]}
     cnode2nasm cond
-    pop "rax"
+    -- pop "rax"
     appendAccm [ "    cmp     rax, 0"
                , "    je      Lend" <> lxxx ]
     nl
@@ -519,7 +526,7 @@ cnode2nasm (CtrlStruct (For {init = init, cond = cond, finexpr = finexpr, stmt =
     cnode2nasm init
     eitherModify $ \s -> s {accm = accm s ++ ["Lbegin" <> lxxx <> ":"]}
     cnode2nasm cond
-    pop "rax"
+    -- pop "rax"
     appendAccm [ "    cmp     rax, 0"
                , "    je      Lend" <> lxxx]
     nl

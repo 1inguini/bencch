@@ -3,10 +3,10 @@
 # set -Ceux
 
 execcode() {
-    clang -c $(ls ./*.c)
+    cc -g -c $(ls ./*.c)
     stack run -- "$1" > tmp.asm
-    nasm -o tmp.o -felf64 tmp.asm
-    cc -nostartfiles -no-pie -o tmp $(ls ./*.o)
+    nasm -g -o tmp.o -felf64 tmp.asm
+    cc -g -nostartfiles -no-pie -o tmp $(ls ./*.o)
     ./tmp
 }
 
