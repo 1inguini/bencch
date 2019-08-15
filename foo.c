@@ -11,8 +11,8 @@ long bar(long a0, long a1, long a2, long a3, long a4, long a5, long a6, long a7,
     long sum = a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + b0 + b1 + b2 +
                b3 + b4 + b5 + b6 + b7 + b8 + b9;
     return printf(
-        "bar(%lu, %lu, %lu, %lu, %lu, %lu, %lu, %lu, %lu, %lu, %lu, %lu, %lu, "
-        "%lu, %lu, %lu, %lu, %lu, %lu, %lu), sum = %lu\n",
+        "bar(%ld, %ld, %ld, %ld, %ld, %ld, %ld, %ld, %ld, %ld, %ld, %ld, %ld, "
+        "%ld, %ld, %ld, %ld, %ld, %ld, %ld), sum = %ld\n",
         a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, b0, b1, b2, b3, b4, b5, b6, b7,
         b8, b9, sum);
 }

@@ -10,6 +10,7 @@ import           Data.Either                as E
 import qualified Data.List                  as List
 import           Data.Map.Strict            as Map
 import           Data.Maybe                 as May
+import qualified Data.Set                   as Set
 import           Data.Text.Lazy             as T
 import qualified Data.Void                  as V
 import           Prelude                    as P
@@ -27,23 +28,36 @@ tshow = pack . show
 
 type Parser = Parsec V.Void Text
 
-data CNode = Branch [CNode]
-           | Expression  CNode
+data CNode = Branch     [CNode]
+           | Value      CValue
+           | DefVar     {defType :: CType, varName :: Text}
+           | AssignVar  {var :: Lhs, val :: CNode}
+           | LoadVar    {var :: Lhs}
+           | Expression CNode
            | CtrlStruct CtrlStruct
-           | CLong   {unwrap :: Integer}
-           | DefVar  {var :: Text}
-           | Var     {mayassign :: Maybe CNode, var :: Text}
-           | Funcall {funcName :: Text, args :: [CNode]}
+           | Funcall    {funcName :: Text, args :: [CNode]}
            | Void
            | EOF
+           deriving  (Show, Eq)
+
+data Lhs = VarName Text
+         | PtrTo   CNode
+         -- | CNode   CNode
+         deriving (Show, Eq)
+
+data CValue = CValue {ctype :: CType, val :: Integer}
+            deriving (Show, Eq)
+
+data CType = CLong
+           | Ptr     CType
+           | Unknown
            deriving  (Show, Eq)
 
 data TopLevel = DeFun { funcName :: Text, args :: [CNode], definition :: [CNode] }
               deriving  (Show, Eq)
 
-type VarName = Text
 type Offset = Integer
-type Variables = Map VarName (Offset, CNode)
+type Variables = Map Text (CType, Offset)
 
 data CtrlStruct = If  { cond :: CNode, stmt :: CNode, elst :: CNode }
                 | Whl { cond :: CNode, stmt :: CNode}
@@ -58,7 +72,7 @@ spaceConsumer = L.space
                 (L.skipBlockComment "/*" "*/")
 
 symbol :: Text -> Parser Text
-symbol = (L.symbol spaceConsumer)
+symbol = L.symbol spaceConsumer
 
 parens, braces, angles, brackets :: Parser a -> Parser a
 parens    = between (symbol "(") (symbol ")")
@@ -71,9 +85,12 @@ identifier =
   spaceConsumer >> rawident <* spaceConsumer
   where
     rawident = do
-      head <- letterChar
-      rest <- many (try letterChar <|> try digitChar <|> single '_')
-      return . pack $ head:rest
+      head <- try letterChar
+      rest <- many $ choice [try letterChar, try digitChar, try $ single '_']
+      let ident = pack $ head:rest in
+        if ident `elem` reserved
+        then fail "reserved word"
+        else return ident
 
 semicolon = symbol ";"
 comma     = symbol ","
@@ -96,15 +113,16 @@ pDeclare = pDeclareFunction
 pDeclareFunction :: Parser TopLevel
 pDeclareFunction = do
   funcName            <- identifier
-  args                <- parens $ pInitialize `sepBy` comma
+  args                <- parens $ pDefVar `sepBy` comma
   (Branch definition) <- blockStmt
   return DeFun {funcName = funcName, args = args, definition = definition}
 
-pStatement, pExpression, pInitialize, pVar, pEquality, pRelational, pAdd, pMul, pTerm, pNum, pUnary, pFuncall
+pStatement, pExpression, pDefVar, pLoadVar, pEquality, pRelational, pAdd, pMul, pTerm, pLong, pUnary, pFuncall
   :: Parser CNode
 
 pStatement = choice
              [ returnStmt
+             , pDefVar
              , whileStmt
              , forStmt
              , ifStmt
@@ -112,22 +130,31 @@ pStatement = choice
              , simpleStmt
              ]
 
-blockStmt, simpleStmt, returnStmt, ifStmt, forStmt, whileStmt :: Parser CNode
+reserved :: [Text]
+reserved = ["return", "long", "while", "for", "if", "else"]
 
-blockStmt = Branch <$> (try . braces $ many pStatement)
+returnStmt, pDefLong, whileStmt, forStmt, ifStmt, blockStmt, simpleStmt :: Parser CNode
 
-simpleStmt = Expression <$> pExpression <* semicolon
+returnStmt = symbol "return" >> CtrlStruct . Ret <$> simpleStmt
 
-returnStmt = try $ symbol "return" >> (CtrlStruct . Ret <$> simpleStmt)
+pDefVar = pDefLong
 
-ifStmt = do
-  cond <- try $ symbol "if" >> parens pEquality
+pDefLong = symbol "long" >>
+           DefVar
+           <$> pPtrTo CLong
+           <*> identifier <* semicolon
+
+pPtrTo :: CType -> Parser CType
+pPtrTo ctype = choice [ symbol "*" >> Ptr <$> pPtrTo ctype
+                      , return ctype]
+
+whileStmt = do
+  cond <- symbol "while" >> parens pEquality
   stmt <- pStatement
-  elst <- option Void (symbol "else" >> pStatement)
-  return $ CtrlStruct If { cond = cond, stmt = stmt, elst = elst }
+  return $ CtrlStruct Whl {cond = cond, stmt = stmt}
 
 forStmt = do
-  init <- try $ symbol "for" >>
+  init <- symbol "for" >>
           parens (do init    <- option Void pAssign
                      _       <- semicolon
                      cond    <- option Void pEquality
@@ -140,63 +167,70 @@ forStmt = do
   stmt <- pStatement
   return $ CtrlStruct init { stmt = stmt }
 
-whileStmt = do
-  cond <- try $ symbol "while" >> parens pEquality
+ifStmt = do
+  cond <- symbol "if" >> parens pEquality
   stmt <- pStatement
-  return $ CtrlStruct Whl {cond = cond, stmt = stmt}
+  elst <- option Void (symbol "else" >> pStatement)
+  return $ CtrlStruct If { cond = cond, stmt = stmt, elst = elst }
+
+blockStmt = Branch <$> (braces $ many pStatement)
+
+simpleStmt = Expression <$> pExpression <* semicolon
 
 pExpression = choice
-              [ pInitialize
-              , pAssign
+              [ pAssign
               , pEquality
               ]
 
-
 pAssign :: Parser CNode
-pAssign = do
-  init       <- try $ pVar <* symbol "="
-  definition <- option Void pExpression
-  return init {mayassign = Just definition}
+pAssign = try $ -- do
+          AssignVar
+          <$> pLhs <* symbol "="
+          <*> pExpression
+  -- ctype <- pPtrTo Unknown
+  -- var   <- identifier <* symbol "="
+  -- val   <- pExpression
+  -- return AssignVar {ctype = ctype, var = var, val = val}
 
-pInitialize = (\x -> DefVar {var = x}) <$> (symbol "long" >> identifier)
-
-pFuncall = try $ do
-  func <- identifier
-  args <- parens $ option [] (pExpression `sepBy` comma)
-  return Funcall {funcName = func, args = args}
+pLhs :: Parser Lhs
+pLhs = try $ choice
+       [ try $ symbol "*" >> PtrTo <$> pUnary
+       , VarName <$> identifier]
+  -- where
+  --   pPtr = genpUnary ("*", pTerm)
 
 pEquality = do
   arg0 <- pRelational
-  option (arg0) (do eq   <- choice $ (P.map symbol) ["==", "!="]
+  option (arg0) (do eq   <- choice $ symbol <$> ["==", "!="]
                     args <- pExpression
                     return Funcall {funcName = eq, args = [arg0, args]})
 
 pRelational = do
   arg0 <- pAdd
-  option (arg0) (do comp <- choice $ (P.map symbol) ["<=", ">=", ">", "<"]
+  option (arg0) (do comp <- choice $ symbol <$> ["<=", ">=", ">", "<"]
                     args <- pExpression
                     return Funcall {funcName = comp, args = [arg0, args]})
 
 pAdd = do
   arg0 <- pMul
-  option (arg0) (do arth <- choice $ (P.map symbol) ["+", "-"]
+  option (arg0) (do arth <- choice $ symbol <$> ["+", "-"]
                     args <- pExpression
                     return Funcall {funcName = arth, args = [arg0, args]})
 
 pMul = do
   arg0 <- pUnary
-  option (arg0) (do arth <- choice $ (P.map symbol) ["*", "/"]
+  option (arg0) (do arth <- choice $ symbol <$> ["*", "/"]
                     args <- pExpression
                     return Funcall {funcName = arth, args = [arg0, args]})
 
-pUnary = choice $ (P.map genpUnary unarysAndParsers) ++ [pTerm]
-  where
-    genpUnary :: (Text, Parser CNode) -> Parser CNode
-    genpUnary (sym, parser) =
-      (\x -> Funcall {funcName = sym, args = [x]}) <$> (try $ symbol sym >> parser)
+pUnary = choice $ (genpUnary <$> unarysAndParsers) ++ [pTerm]
+
+genpUnary :: (Text, Parser CNode) -> Parser CNode
+genpUnary (sym, parser) =
+  (\x -> Funcall {funcName = sym, args = [x]}) <$> (symbol sym >> parser)
 
 unarys :: [Text]
-unarys = P.map fst unarysAndParsers
+unarys = fst <$> unarysAndParsers
 
 unarysAndParsers :: [(Text, Parser CNode)]
 unarysAndParsers = [ ("+", pTerm)
@@ -207,15 +241,19 @@ unarysAndParsers = [ ("+", pTerm)
 
 pTerm = choice
         [ pFuncall
-        , pVar
-        , pNum
-        , parens pExpression]
+        , pLoadVar
+        , pLong
+        , parens pExpression
+        ]
 
-pVar = do
-  identifier <- try $ identifier
-  return Var {mayassign = Nothing, var = identifier}
+pFuncall = try $ do
+  func <- identifier
+  args <- parens $ option [] (pExpression `sepBy` comma)
+  return Funcall {funcName = func, args = args}
 
-pNum = CLong <$> try integer
+pLoadVar = LoadVar <$> pLhs
+
+pLong = (\num -> Value CValue {ctype = CLong, val = num}) <$> try integer
 
 data CState = CState
             { stnum   :: Integer
@@ -226,19 +264,19 @@ data CState = CState
             , defName :: Text
             } deriving (Show, Eq)
 
-data NasmGenError = VariableNotDefined Text
-                  | MultipleDeclaration Text
-                  | UnmatchedArgNum     {funcName :: Text, argsgot :: [CNode]}
+data NasmGenError = VariableNotDefined     Lhs
+                  | MultipleDeclaration    Text
+                  | VariableNotInitialized {var :: Lhs}
+                  | VariableUnknownType    {var :: Lhs, mayval :: Maybe CNode}
+                  | UnknownCValue          CValue
+                  | UnmatchedType          {var :: Lhs, oldCtype, newCtype :: CType}
+                  | UnmatchedArgNum        {funcName :: Text, argsgot :: [CNode]}
                   deriving (Show, Eq)
 
-type CStateOrError = Either NasmGenError CState
+type CStateOrError = Either (CState, CNode, NasmGenError) CState
 
-eitherModify :: (CState -> CState) -> St.State CStateOrError ()
-eitherModify f = modify (fmap f)
-
-unwrapEitherS :: (CState -> St.State CStateOrError ()) -> CStateOrError -> St.State CStateOrError ()
-unwrapEitherS m (Right s)    = m s
-unwrapEitherS _ err@(Left _) = put err
+throwNasmGenError :: CNode -> NasmGenError -> St.State CStateOrError ()
+throwNasmGenError cnode nasmGenError = unwrapGet $ \s -> (put . Left) (s, cnode, nasmGenError)
 
 sysVCallRegs :: [Text]
 sysVCallRegs = [ "rdi", "rsi", "rdx", "rcx", "r8", "r9"]
@@ -246,23 +284,23 @@ sysVCallRegs = [ "rdi", "rsi", "rdx", "rcx", "r8", "r9"]
 biops :: [Text]
 biops = ["+", "-", "*", "/", "==", "!=", ">", ">=", "<", "<="]
 
-program2nasm :: [TopLevel] -> [Text]
+program2nasm :: [TopLevel] -> Either (CState, CNode, NasmGenError) [Text]
 program2nasm tops =
   let
     toText :: CState -> [Text]
     toText (CState {accm = accm}) = accm
     genExtern :: CState -> [Text]
-    genExtern (CState {externs = externs}) = P.map (\func -> "extern " <> func) externs
-    eitherCState = (execState (mapM_ toplevel2nasm tops)
-                     $ Right CState { stnum   = 0
-                                    , funcs   = []
-                                    , externs = []
-                                    , vars    = Map.empty
-                                    , accm    = []
-                                    , defName = T.empty})
+    genExtern (CState {externs = externs}) = (\func -> "extern " <> func) <$> externs
+    eitherCState = execState (mapM_ toplevel2nasm tops)
+                   $ Right CState { stnum   = 0
+                                  , funcs   = []
+                                  , externs = []
+                                  , vars    = Map.empty
+                                  , accm    = []
+                                  , defName = T.empty }
   in
   case eitherCState of
-    Right cstate -> genExtern cstate ++
+    Right cstate -> Right $ genExtern cstate ++
                     [ "section .text"
                     , "global _start"
                     , ""
@@ -277,7 +315,7 @@ program2nasm tops =
                     , "; generated code"
                     , ""] ++
                     toText cstate
-    Left err     -> [tshow err]
+    Left err     -> Left err
 
 toplevel2nasm :: TopLevel -> St.State CStateOrError ()
 toplevel2nasm DeFun {funcName = funcName, args = args, definition = definition} = do
@@ -285,13 +323,13 @@ toplevel2nasm DeFun {funcName = funcName, args = args, definition = definition} 
   mapM_ genLocals (args ++ definition)
   eitherModify $ \s -> s { defName = funcName
                          , funcs = funcName:(funcs s)
-                         , accm = accm s ++
-                                  [ funcName <> ":"
-                                  , "; prologe"] }
+                         }
+  appendAccm [ funcName <> ":"
+             , "; prologe"]
   push "rbp"
   mov "rbp" "rsp"
-  get >>= unwrapEitherS (\s -> do matchCommand "-" "rsp" (tshow (maximumDef 0 $ P.map fst (elems $ vars s)))
-                                  eitherModify $ \s -> s {vars = Map.empty})
+  unwrapGet $ \s -> do matchCommand "-" "rsp" (tshow (maximumDef 0 $ snd <$> (elems $ vars s)))
+                       eitherModify $ \s -> s {vars = Map.empty}
   nl
   assign6Args 0 (P.take (P.length args) sysVCallRegs)
   assignRestArgs (P.length sysVCallRegs) (P.drop (P.length sysVCallRegs) args)
@@ -315,14 +353,15 @@ toplevel2nasm DeFun {funcName = funcName, args = args, definition = definition} 
       assignRestArgs (succ index) xs
 
 genLocals :: CNode -> St.State CStateOrError ()
-genLocals DefVar {var = var} = do
-  get >>= unwrapEitherS
-    (\s ->
-       maybe
-       (let newoffset = 8 + (maximumDef 0 $ P.map fst (elems $ vars s)) in do
-           eitherModify $ \s -> s { vars = insert var (newoffset, Void) $ vars s})
-       (\_ -> put . Left . MultipleDeclaration $ var)
-       $ vars s !? var)
+genLocals n@DefVar {defType = Ptr ctype} =
+  genLocals n {defType = ctype}
+genLocals n@DefVar {defType = ctype, varName = varName} =
+  unwrapGet $ \s ->
+    maybe
+    (let newoffset = 8 + (maximumDef 0 $ snd <$> (elems $ vars s)) in do
+        eitherModify $ \s -> s { vars = insert varName (ctype, newoffset) $ vars s})
+    (\_ -> throwNasmGenError n $ MultipleDeclaration varName)
+    $ vars s !? varName
 
 genLocals (Branch []) = modify id
 genLocals (Branch nodeList) =
@@ -341,70 +380,89 @@ genLocals (CtrlStruct (Ret node)) = do
   genLocals node
 genLocals _ = modify id
 
+
 cnode2nasm :: CNode -> St.State CStateOrError ()
-cnode2nasm (Branch []) = get >>= put
+cnode2nasm (Branch []) = modify id
 cnode2nasm (Branch nodeList) =
   mapM_ cnode2nasm nodeList
 cnode2nasm (Expression node) = do
+  appendAccm [ "; statement start"]
   cnode2nasm node
-  eitherModify $ \s -> s { stnum = stnum s + 1
-                         , accm = accm s ++ [ "; statement end"]}
   pop "rax"
+  appendAccm [ "; statement end"]
+  eitherModify $ \s -> s { stnum = stnum s + 1 }
   nl
 
-cnode2nasm (CLong num) = push (tshow num)
+cnode2nasm (Value CValue {ctype = CLong, val = num}) = push (tshow num)
+cnode2nasm n@(Value CValue {ctype = Ptr ctype})      = stackUnary "*" n {defType = ctype}
+cnode2nasm n@(Value cval@CValue {ctype = Unknown})   = throwNasmGenError n $ UnknownCValue cval
 
-cnode2nasm DefVar {var = var} = do
-  get >>= unwrapEitherS
+-- cnode2nasm n@DefVar {defType = Ptr ctype} = cnode2nasm n {defType = ctype}
+cnode2nasm n@DefVar {defType = ctype, varName = varName} = do
+  unwrapGet
     (\s ->
        maybe
-       (let newoffset = 8 + (maximumDef 0 $ P.map fst (elems $ vars s)) in do
-           push "0"
-           stackAssign newoffset
-           eitherModify $ \s -> s { vars = insert var (newoffset, Void) $ vars s})
-       (\_ -> put . Left . MultipleDeclaration $ var)
-       $ vars s !? var)
+       (let newoffset = 8 + (maximumDef 0 $ snd <$> (elems $ vars s)) in do
+           eitherModify $ \s -> s { vars = insert varName (ctype, newoffset) $ vars s}
+           appendAccm [ "    ; " <> tshow n ]
+           nl)
+       (\_ -> throwNasmGenError n $ MultipleDeclaration varName)
+       $ vars s !? varName)
 
-cnode2nasm Var {var = var, mayassign = Nothing} = do
+cnode2nasm n@AssignVar {var = PtrTo cnode, val = val} =  do
+  s <- get
+  case s of
+    Right s -> do cnode2nasm cnode
+                  cnode2nasm val
+                  pop "rcx"
+                  pop "rax"
+                  mov "[rax]" "rcx"
+                  push "rcx"
+                  nl
+    err     -> put err
+
+cnode2nasm n@AssignVar {var = varname@(VarName var), val = val} = do
   s <- get
   case s of
     Right s -> maybe
-               (put . Left . VariableNotDefined $ var)
-               (\(offset, _) -> stackLoadLval offset)
+               (throwNasmGenError n $ VariableNotDefined varname)
+               (\(ctype, offset) -> -- case ctype of
+                                      -- Ptr ctype -> stackUnary "*" n {}
+                                      -- _         -> cnode2nasm value
+                   cnode2nasm val >> stackAssign offset)
                $ vars s !? var
     err     -> put err
 
-cnode2nasm Var {var = var, mayassign = Just value} = do
-  cnode2nasm value
+-- cnode2nasm n@(LoadVar {var = PtrTo var}) = do
+cnode2nasm n@(LoadVar {var = var@(VarName varName)}) = do
   s <- get
   case s of
     Right s -> maybe
-               (put . Left . VariableNotDefined $ var)
-               (\(offset, _) -> stackAssign offset)
-               $ vars s !? var
+               (throwNasmGenError n $ VariableNotDefined var)
+               (\(_, offset) -> stackLoadLval offset)
+               $ vars s !? varName
     err     -> put err
 
-cnode2nasm Funcall {funcName = funcName, args = args} =
-  case ( funcName `elem`  biops
+cnode2nasm n@Funcall {funcName = funcName, args = args} =
+  case ( funcName `elem` biops
        , funcName `elem` unarys
        , P.length args) of
     (True, _, 2) -> stackExec funcName (atDef Void args 0) (atDef Void args 1)
 
     (_, True, 1) -> stackUnary funcName (atDef Void args 0)
 
-    (True, _, _) -> modify $ \_ -> Left UnmatchedArgNum {funcName = funcName, argsgot = args }
-    (_, True, _) -> modify $ \_ -> Left UnmatchedArgNum {funcName = funcName, argsgot = args }
+    (True, _, _) -> throwNasmGenError n $ UnmatchedArgNum {funcName = funcName, argsgot = args }
+    (_, True, _) -> throwNasmGenError n $ UnmatchedArgNum {funcName = funcName, argsgot = args }
 
-    (False, _, _) -> get >>= unwrapEitherS
-      (\s -> do
-          if funcName `elem` funcs s
-            then modify id
-            else eitherModify $ \s -> s {externs = funcName:(externs s)}
-          fst6args 0 sysVCallRegs
-          mapM_ cnode2nasm (P.reverse $ P.drop (P.length sysVCallRegs) args)
-          eitherModify (\s -> s {accm = accm s ++ [ "    call    " <> funcName]})
-          push "rax"
-          nl)
+    (False, _, _) -> unwrapGet $ \s -> do
+      if funcName `elem` funcs s
+        then modify id
+        else eitherModify $ \s -> s {externs = funcName:(externs s)}
+      fst6args 0 sysVCallRegs
+      mapM_ cnode2nasm (P.reverse $ P.drop (P.length sysVCallRegs) args)
+      appendAccm [ "    call    " <> funcName]
+      push "rax"
+      nl
   where
     fst6args :: Integral a => a -> [Text] -> St.State CStateOrError ()
     fst6args 6 _ = modify id
@@ -418,73 +476,82 @@ cnode2nasm Funcall {funcName = funcName, args = args} =
         Nothing  -> modify id
 
 cnode2nasm (CtrlStruct (If {cond = cond, stmt = stmt, elst = Void})) =
-  get >>= unwrapEitherS (\s ->
+  unwrapGet $ \s ->
   let lxxx = (tshow . stnum) s in do
     cnode2nasm cond
     pop "rax"
-    eitherModify $ \s -> s {accm = accm s ++
-                             [ "    cmp     rax, 0"
-                             , "    je      Lend" <> lxxx,""]}
+    appendAccm [ "    cmp     rax, 0"
+               , "    je      Lend" <> lxxx
+               ,""]
     cnode2nasm stmt
-    eitherModify $ \s -> s {accm = accm s ++ ["Lend" <> lxxx <> ":"]})
+    appendAccm [ "Lend" <> lxxx <> ":" ]
 
 cnode2nasm (CtrlStruct (If {cond = cond, stmt = stmt, elst = elst})) =
-  get >>= unwrapEitherS (\s ->
+  unwrapGet $ \s ->
   let lxxx = (tshow . stnum) s in do
     cnode2nasm cond
     pop "rax"
-    eitherModify $ \s -> s {accm = accm s ++
-                             [ "    cmp     rax, 0"
-                             , "    je      Lelse" <> lxxx, ""]}
+    appendAccm [ "    cmp     rax, 0"
+               , "    je      Lelse" <> lxxx ]
+    nl
     cnode2nasm stmt
-    eitherModify $ \s -> s {accm = accm s ++
-                             [ "    jmp     Lend" <> lxxx
-                             , "Lelse" <> lxxx <> ":"]}
+    appendAccm [ "    jmp     Lend" <> lxxx
+               , "Lelse" <> lxxx <> ":" ]
     cnode2nasm elst
-    eitherModify $ \s -> s {accm = accm s ++ ("Lend" <> lxxx <> ":"):[]})
+    appendAccm [ "Lend" <> lxxx <> ":" ]
 
 cnode2nasm (CtrlStruct (Whl {cond = cond, stmt = stmt})) =
-  get >>= unwrapEitherS
-  (\s -> let lxxx = (tshow . stnum) s in do
-      eitherModify $ \s -> s {accm = accm s ++ ("Lbegin" <> lxxx <> ":"):[]}
-      cnode2nasm cond
-      pop "rax"
-      eitherModify $ \s -> s {accm = accm s ++
-                                  [ "    cmp     rax, 0"
-                                  , "    je      Lend" <> lxxx, ""]}
-      cnode2nasm stmt
-      eitherModify $ \s -> s {accm = accm s ++
-                                  [ "    jmp     Lbegin" <> lxxx
-                                  , "Lend" <> lxxx <> ":"]})
+  unwrapGet $ \s ->
+  let lxxx = (tshow . stnum) s in do
+    eitherModify $ \s -> s {accm = accm s ++ ("Lbegin" <> lxxx <> ":"):[]}
+    cnode2nasm cond
+    pop "rax"
+    appendAccm [ "    cmp     rax, 0"
+               , "    je      Lend" <> lxxx ]
+    nl
+    cnode2nasm stmt
+    appendAccm [ "    jmp     Lbegin" <> lxxx
+               , "Lend" <> lxxx <> ":"]
 
 cnode2nasm (CtrlStruct (For {init = init, cond = cond, finexpr = finexpr, stmt = stmt})) =
-  get >>= unwrapEitherS
-  (\s -> let lxxx = (tshow . stnum) s in do
-      cnode2nasm init
-      eitherModify $ \s -> s {accm = accm s ++ ["Lbegin" <> lxxx <> ":"]}
-      cnode2nasm cond
-      pop "rax"
-      eitherModify $ \s -> s {accm = accm s ++
-                                  [ "    cmp     rax, 0"
-                                  , "    je      Lend" <> lxxx]}
-      nl
-      cnode2nasm stmt
-      cnode2nasm finexpr
-      eitherModify $ \s -> s {accm = accm s ++
-                                  [ "    jmp     Lbegin" <> lxxx
-                                  , "Lend" <> lxxx <> ":"]})
+  unwrapGet $ \s ->
+  let lxxx = (tshow . stnum) s in do
+    cnode2nasm init
+    eitherModify $ \s -> s {accm = accm s ++ ["Lbegin" <> lxxx <> ":"]}
+    cnode2nasm cond
+    pop "rax"
+    appendAccm [ "    cmp     rax, 0"
+               , "    je      Lend" <> lxxx]
+    nl
+    cnode2nasm stmt
+    cnode2nasm finexpr
+    appendAccm [ "    jmp     Lbegin" <> lxxx
+               , "Lend" <> lxxx <> ":"]
 
 cnode2nasm (CtrlStruct (Ret node)) = do
   cnode2nasm node
-  eitherModify $ \s -> s {accm = accm s ++ ["; epiloge"]}
+  appendAccm ["; epiloge"]
   -- pop "rax"
   mov "rsp" "rbp"
   pop "rbp"
-  eitherModify $ \s -> s {accm = accm s ++ ["    ret"]}
+  appendAccm ["    ret"]
   nl
 
-cnode2nasm EOF = get >>= put
-cnode2nasm Void = get >>= put
+cnode2nasm EOF  = modify id
+cnode2nasm Void = modify id
+
+eitherModify :: (CState -> CState) -> St.State CStateOrError ()
+eitherModify f = modify (fmap f)
+
+unwrapEitherS :: (CState -> St.State CStateOrError ()) -> CStateOrError -> St.State CStateOrError ()
+unwrapEitherS m (Right s)    = m s
+unwrapEitherS _ err@(Left _) = put err
+
+unwrapGet :: (CState -> St.State CStateOrError ()) -> St.State CStateOrError ()
+unwrapGet f = get >>= unwrapEitherS f
+
+appendAccm :: [Text] -> St.State CStateOrError ()
+appendAccm texts = eitherModify $ \s -> s {accm = accm s ++ texts}
 
 stackExec :: Text -> CNode -> CNode -> St.State CStateOrError ()
 stackExec func arg0 arg1 = do
@@ -497,21 +564,19 @@ stackExec func arg0 arg1 = do
   nl
 
 matchCommand :: Text -> Text -> Text -> St.State CStateOrError ()
-matchCommand func arg0 arg1 = do
-  eitherModify $ \s ->
-    s {accm = accm s ++
-              case func of
-                "+"  -> [ "    add     " <> arg0 <> ", " <> arg1 ]
-                "-"  -> [ "    sub     " <> arg0 <> ", " <> arg1 ]
-                "*"  -> [ "    mov     rax, " <> arg0, "    imul    " <> arg1 ]
-                "/"  -> [ "    mov     rax, " <> arg0, "    idiv    " <> arg1 ]
-                "==" -> [ "    cmp     " <> arg0 <> ", " <> arg1, "    sete    al" , "    movzx   rax, al" ]
-                "!=" -> [ "    cmp     " <> arg0 <> ", " <> arg1, "    setne   al" , "    movzx   rax, al" ]
-                ">"  -> [ "    cmp     " <> arg1 <> ", " <> arg0, "    setl    al" , "    movzx   rax, al" ]
-                ">=" -> [ "    cmp     " <> arg1 <> ", " <> arg0, "    setle   al" , "    movzx   rax, al" ]
-                "<"  -> [ "    cmp     " <> arg0 <> ", " <> arg1, "    setl    al" , "    movzx   rax, al" ]
-                "<=" -> [ "    cmp     " <> arg0 <> ", " <> arg1, "    setle   al" , "    movzx   rax, al" ]
-                _    -> []}
+matchCommand func arg0 arg1 =
+  appendAccm $ case func of
+                 "+"  -> [ "    add     " <> arg0 <> ", " <> arg1 ]
+                 "-"  -> [ "    sub     " <> arg0 <> ", " <> arg1 ]
+                 "*"  -> [ "    mov     rax, " <> arg0, "    imul    " <> arg1 ]
+                 "/"  -> [ "    mov     rax, " <> arg0, "    idiv    " <> arg1 ]
+                 "==" -> [ "    cmp     " <> arg0 <> ", " <> arg1, "    sete    al" , "    movzx   rax, al" ]
+                 "!=" -> [ "    cmp     " <> arg0 <> ", " <> arg1, "    setne   al" , "    movzx   rax, al" ]
+                 ">"  -> [ "    cmp     " <> arg1 <> ", " <> arg0, "    setl    al" , "    movzx   rax, al" ]
+                 ">=" -> [ "    cmp     " <> arg1 <> ", " <> arg0, "    setle   al" , "    movzx   rax, al" ]
+                 "<"  -> [ "    cmp     " <> arg0 <> ", " <> arg1, "    setl    al" , "    movzx   rax, al" ]
+                 "<=" -> [ "    cmp     " <> arg0 <> ", " <> arg1, "    setle   al" , "    movzx   rax, al" ]
+                 _    -> []
 
 stackUnary :: Text -> CNode -> St.State CStateOrError ()
 stackUnary func arg =
@@ -521,29 +586,33 @@ stackUnary func arg =
               "*" -> cnode2nasm arg >> pop "rax" >> push "[rax]"
               "&" -> do s <- get
                         case (arg, s) of
-                          (Var {var = var}, Right s) -> maybe
-                                                        (put . Left . VariableNotDefined $ var)
-                                                        (\(offset, _) -> do mov "rax" "rbp"
-                                                                            matchCommand "-" "rax" (tshow offset)
-                                                                            push "rax")
-                                                        $ vars s !? var
-                          (var, Right s)             -> (put . Left . VariableNotDefined $ tshow var)
-                          (_, err@(Left _))          -> put err
+                          -- (n@(LoadVar {ctype = Ptr ctype ,var = var}), Right s) ->
+                          --   stackUnary "*" n {ctype = ctype}
+                          (n@(LoadVar {var = var@(VarName varName)}), Right s) ->
+                            maybe
+                            (throwNasmGenError n $ VariableNotDefined var)
+                            (\(ctype, offset) -> case ctype of
+                                                   -- Ptr ctype -> stackUnary "*" n {}
+                                                   ctype     -> leaOffset "rax" offset >> push "rax")
+                            $ vars s !? varName
+
+                          (n@(LoadVar {var = var}), Right s)  -> throwNasmGenError n $ VariableNotDefined var
+                          (_, err@(Left _)) -> put err
               _   -> modify id
             >> nl
 
 nasmNeg :: Text -> St.State CStateOrError ()
-nasmNeg arg = eitherModify $ \s -> s {accm = accm s ++  [ "    neg     " <> arg ]}
+nasmNeg arg = appendAccm [ "    neg     " <> arg ]
 
 stackAssign :: (Integral a, Show a) => a -> St.State CStateOrError ()
 stackAssign theoffset = do
-  pop ("[rbp-" <> (tshow theoffset) <> "]")
-  push ("[rbp-" <> (tshow theoffset) <> "]")
+  pop ("[rbp-" <> tshow theoffset <> "]")
+  push ("[rbp-" <> tshow theoffset <> "]")
   nl
 
 stackLoadLval :: (Integral a, Show a) => a -> St.State CStateOrError ()
 stackLoadLval theoffset = do
-  push ("[rbp-" <> (tshow theoffset) <> "]")
+  push ("[rbp-" <> tshow theoffset <> "]")
   nl
 
 -- genLVal :: (Integral a, Show a) => a -> St.State CStateOrError ()
@@ -552,29 +621,36 @@ stackLoadLval theoffset = do
 --   matchCommand "-" "rax" (tshow theoffset)
 
 push :: Text -> St.State CStateOrError ()
-push num = eitherModify $ \s ->
-  s {accm = accm s ++ [ "    push    qword " <> num ]}
+push num =
+  appendAccm [ "    push    qword " <> num ]
 
 pop :: Text -> St.State CStateOrError ()
-pop num = eitherModify $ \s ->
-  s {accm = accm s ++ [ "    pop     qword " <> num ]}
+pop num =
+  appendAccm [ "    pop     qword " <> num ]
 
 mov :: Text -> Text -> St.State CStateOrError ()
-mov dest src = eitherModify $ \s ->
-  s {accm = accm s ++ [ "    mov     " <> dest <> ", qword " <> src]}
+mov dest src =
+  appendAccm [ "    mov     " <> dest <> ", qword " <> src]
+
+lea :: Text -> Text -> St.State CStateOrError ()
+lea dest src =
+  appendAccm [ "    lea     " <> dest <> ", [" <> src <> "]"]
+
+leaOffset :: (Integral a, Show a) => Text -> a -> St.State CStateOrError ()
+leaOffset dest offset = lea dest ("rbp-" <> tshow offset)
 
 nl :: St.State CStateOrError ()
-nl = eitherModify $ \s ->
-  s {accm = accm s ++ [""]}
+nl = appendAccm [ "" ]
 
 main :: IO ()
 main = do
   input <- pack . List.head <$> Env.getArgs
-  -- parseTest mainParser input
   case parse mainParser "" input of
     Right parsed -> do
       -- putStrLn . unpack . PrettyS.pShow $ parsed
-      mapM_ (putStrLn . unpack) $ program2nasm parsed
+      case program2nasm parsed of
+        Right nasm -> mapM_ (putStrLn . unpack) $ nasm
+        Left err   -> putStrLn . unpack . PrettyS.pShow $ err
     Left err  -> putStrLn $ MP.E.errorBundlePretty err
 
 debugmain :: String -> IO ()
@@ -582,5 +658,7 @@ debugmain input =
     case parse mainParser "" (pack input) of
     Right parsed -> do
       putStrLn . unpack . PrettyS.pShow $ parsed
-      mapM_ (putStrLn . unpack) $ program2nasm parsed
+      -- case program2nasm parsed of
+      --   Right nasm -> mapM_ (putStrLn . unpack) $ nasm
+      --   Left err   -> putStrLn . unpack . PrettyS.pShow $ err
     Left err  -> putStrLn $ MP.E.errorBundlePretty err
