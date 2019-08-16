@@ -74,7 +74,7 @@ pDeclareFunction = do
   args                <- parens $ pDefVar `sepBy` comma
   (Branch definition) <- blockStmt
   return DeFun { ctype = case ctypeName of
-                           "long" -> CLong
+                           "long" -> Long
                            _      -> Unknown
                , funcName = funcName, args = args, definition = definition}
 
@@ -104,7 +104,7 @@ pDefVar = pDefLong
 
 pDefLong = symbol "long" >>
            DefVar
-           <$> pPtrTo CLong
+           <$> pPtrTo Long
            <*> identifier
 
 pPtrTo :: CType -> Parser CType
@@ -146,14 +146,11 @@ pExpression = choice
               ]
 
 pAssign :: Parser CNode
-pAssign = try $ -- do
-          AssignVar
-          <$> pLhs <* symbol "="
-          <*> pExpression
-  -- ctype <- pPtrTo Unknown
-  -- var   <- identifier <* symbol "="
-  -- val   <- pExpression
-  -- return AssignVar {ctype = ctype, var = var, val = val}
+pAssign = try $ do
+  ctype <- pPtrTo Unknown
+  var   <- pLhs <* symbol "="
+  val   <- pExpression
+  return AssignVar {ctype = ctype, var = var, val = val}
 
 pLhs :: Parser Lhs
 pLhs = try $ choice
@@ -204,6 +201,8 @@ pFuncall = try $ do
   args <- parens $ option [] (pExpression `sepBy` comma)
   return Funcall {funcName = func, args = args}
 
-pLoadVar = LoadVar <$> pLhs
+pLoadVar = do
+  var <- pLhs
+  return LoadVar {ctype = Unknown, var = var}
 
-pLong = (\num -> Value CValue {ctype = CLong, val = num}) <$> try integer
+pLong = (\num -> Value CValue {ctype = Long, val = num}) <$> try integer

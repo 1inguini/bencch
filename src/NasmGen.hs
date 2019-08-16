@@ -5,25 +5,15 @@
 module NasmGen ( program2nasm ) where
 
 import           Definition
-import           Parser
 
-import           Control.Monad.State        as St
-import           Data.Either                as E
-import qualified Data.List                  as List
-import           Data.Map.Strict            as Map
-import           Data.Maybe                 as May
-import qualified Data.Set                   as Set
-import           Data.Text.Lazy             as T
-import qualified Data.Void                  as V
-import           Prelude                    as P
-import           Safe                       as Safe
-import           System.Environment         as Env
-import           Text.Megaparsec            as MP
-import           Text.Megaparsec.Char
-import qualified Text.Megaparsec.Char.Lexer as L
-import qualified Text.Megaparsec.Debug      as MP.Debug
-import qualified Text.Megaparsec.Error      as MP.E
-import qualified Text.Pretty.Simple         as PrettyS
+import           Control.Monad.State as St
+import           Data.Either         as E
+import           Data.Map.Strict     as Map
+import           Data.Maybe          as May
+import           Data.Text.Lazy      as T
+import           Prelude             as P
+import           Safe                as Safe
+import qualified Text.Pretty.Simple  as PrettyS
 
 tshow :: Show a => a -> Text
 tshow = pack . show
@@ -65,19 +55,20 @@ program2nasm tops =
                     , "    mov     rax, 1"
                     , "    int     0x80"
                     , ""
-                    , "; generated code"
+                    , ";; generated code"
                     , ""] ++
                     toText cstate
     Left err     -> Left err
 
 toplevel2nasm :: TopLevel -> St.State CStateOrError ()
-toplevel2nasm DeFun {funcName = funcName, args = args, definition = definition} = do
+toplevel2nasm DeFun {ctype = ctype ,funcName = funcName, args = args, definition = definition} = do
   eitherModify $ \s -> s { vars    = Map.empty
                          , defName = funcName
                          , funcs   = funcName:(funcs s)
                          }
-  appendAccm [ funcName <> ":"
-             , "; prologe"]
+  appendAccm [  ";; " <> PrettyS.pShowNoColor ctype
+             , funcName <> ":"
+             , ";; prologe"]
   push "rbp"
   mov "rbp" "rsp"
   mapM_ genLocals (args ++ definition)
@@ -121,13 +112,13 @@ genLocals (Branch nodeList) =
   mapM_ genLocals nodeList
 genLocals (Expression node) =
   genLocals node
-genLocals (CtrlStruct (If {cond = cond, stmt = stmt, elst = Void})) =
+genLocals (CtrlStruct If {cond = cond, stmt = stmt, elst = Void}) =
   mapM_ genLocals [cond, stmt]
-genLocals (CtrlStruct (If {cond = cond, stmt = stmt, elst = elst})) =
+genLocals (CtrlStruct If {cond = cond, stmt = stmt, elst = elst}) =
   mapM_ genLocals [cond, stmt, elst]
-genLocals (CtrlStruct (Whl {cond = cond, stmt = stmt})) =
+genLocals (CtrlStruct Whl {cond = cond, stmt = stmt}) =
   mapM_ genLocals [cond, stmt]
-genLocals (CtrlStruct (For {init = init, cond = cond, finexpr = finexpr, stmt = stmt})) =
+genLocals (CtrlStruct For {init = init, cond = cond, finexpr = finexpr, stmt = stmt}) =
   mapM_ genLocals [init, cond, stmt, finexpr]
 genLocals (CtrlStruct (Ret node)) = do
   genLocals node
@@ -139,16 +130,18 @@ cnode2nasm (Branch []) = modify id
 cnode2nasm (Branch nodeList) =
   mapM_ cnode2nasm nodeList
 cnode2nasm (Expression node) = do
-  appendAccm [ "; statement start"]
+  appendAccm
+    $ P.map (";; " <>) ( T.lines $ PrettyS.pShowNoColor node)
+    ++ [ ";; statement start"]
   cnode2nasm node
   pop "rax"
-  appendAccm [ "; statement end"]
+  appendAccm [ ";; statement end"]
   eitherModify $ \s -> s { stnum = stnum s + 1 }
   nl
 
-cnode2nasm (Value CValue {ctype = CLong, val = num}) = push (tshow num)
-cnode2nasm n@(Value CValue {ctype = Ptr ctype})      = stackUnary "*" n {defType = ctype}
-cnode2nasm n@(Value cval@CValue {ctype = Unknown})   = throwNasmGenError n $ UnknownCValue cval
+cnode2nasm (Value CValue {ctype = Long, val = num}) = push (tshow num)
+cnode2nasm n@(Value CValue {ctype = Ptr ctype})     = stackUnary "*" n {defType = ctype}
+cnode2nasm n@(Value cval@CValue {ctype = Unknown})  = throwNasmGenError n $ UnknownCValue cval
 
 -- cnode2nasm n@DefVar {defType = Ptr ctype} = cnode2nasm n {defType = ctype}
 cnode2nasm n@DefVar {defType = ctype, varName = varName} = do
@@ -157,7 +150,7 @@ cnode2nasm n@DefVar {defType = ctype, varName = varName} = do
        maybe
        (let newoffset = 8 + (maximumDef 0 $ snd <$> (elems $ vars s)) in do
            eitherModify $ \s -> s { vars = insert varName (ctype, newoffset) $ vars s}
-           appendAccm [ "    ; " <> tshow n ]
+           appendAccm [ "    ;; " <> PrettyS.pShowNoColor n ]
            nl)
        (\_ -> modify id -- throwNasmGenError n $ MultipleDeclaration varName
        )
@@ -188,7 +181,7 @@ cnode2nasm n@AssignVar {var = varname@(VarName var), val = val} = do
     err     -> put err
 
 -- cnode2nasm n@(LoadVar {var = PtrTo var}) = do
-cnode2nasm n@(LoadVar {var = var@(VarName varName)}) = do
+cnode2nasm n@LoadVar {var = var@(VarName varName)} = do
   s <- get
   case s of
     Right s -> maybe
@@ -212,9 +205,10 @@ cnode2nasm n@Funcall {funcName = funcName, args = args} =
       if funcName `elem` funcs s
         then modify id
         else eitherModify $ \s -> s {externs = funcName:(externs s)}
+      appendAccm [ "    ;; args " ]
       fst6args 0 sysVCallRegs
       mapM_ cnode2nasm (P.reverse $ P.drop (P.length sysVCallRegs) args)
-      appendAccm [ "    call    " <> funcName]
+      appendAccm [ "    call    " <> funcName ]
       push "rax"
       nl
   where
@@ -229,22 +223,20 @@ cnode2nasm n@Funcall {funcName = funcName, args = args} =
           fst6args (succ index) registers
         Nothing  -> modify id
 
-cnode2nasm (CtrlStruct (If {cond = cond, stmt = stmt, elst = Void})) =
+cnode2nasm (CtrlStruct If {cond = cond, stmt = stmt, elst = Void}) =
   unwrapGet $ \s ->
   let lxxx = (tshow . stnum) s in do
     cnode2nasm cond
-    -- pop "rax"
     appendAccm [ "    cmp     rax, 0"
-               , "    je      Lend" <> lxxx
-               ,""]
+               , "    je      Lend" <> lxxx ]
+    nl
     cnode2nasm stmt
     appendAccm [ "Lend" <> lxxx <> ":" ]
 
-cnode2nasm (CtrlStruct (If {cond = cond, stmt = stmt, elst = elst})) =
+cnode2nasm (CtrlStruct If {cond = cond, stmt = stmt, elst = elst}) =
   unwrapGet $ \s ->
   let lxxx = (tshow . stnum) s in do
     cnode2nasm cond
-    -- pop "rax"
     appendAccm [ "    cmp     rax, 0"
                , "    je      Lelse" <> lxxx ]
     nl
@@ -259,7 +251,6 @@ cnode2nasm (CtrlStruct (Whl {cond = cond, stmt = stmt})) =
   let lxxx = (tshow . stnum) s in do
     eitherModify $ \s -> s {accm = accm s ++ ("Lbegin" <> lxxx <> ":"):[]}
     cnode2nasm cond
-    -- pop "rax"
     appendAccm [ "    cmp     rax, 0"
                , "    je      Lend" <> lxxx ]
     nl
@@ -267,13 +258,12 @@ cnode2nasm (CtrlStruct (Whl {cond = cond, stmt = stmt})) =
     appendAccm [ "    jmp     Lbegin" <> lxxx
                , "Lend" <> lxxx <> ":"]
 
-cnode2nasm (CtrlStruct (For {init = init, cond = cond, finexpr = finexpr, stmt = stmt})) =
+cnode2nasm (CtrlStruct For {init = init, cond = cond, finexpr = finexpr, stmt = stmt}) =
   unwrapGet $ \s ->
   let lxxx = (tshow . stnum) s in do
     cnode2nasm init
     eitherModify $ \s -> s {accm = accm s ++ ["Lbegin" <> lxxx <> ":"]}
     cnode2nasm cond
-    -- pop "rax"
     appendAccm [ "    cmp     rax, 0"
                , "    je      Lend" <> lxxx]
     nl
@@ -284,8 +274,7 @@ cnode2nasm (CtrlStruct (For {init = init, cond = cond, finexpr = finexpr, stmt =
 
 cnode2nasm (CtrlStruct (Ret node)) = do
   cnode2nasm node
-  appendAccm ["; epiloge"]
-  -- pop "rax"
+  appendAccm [";; epiloge"]
   mov "rsp" "rbp"
   pop "rbp"
   appendAccm ["    ret"]
@@ -308,7 +297,7 @@ appendAccm :: [Text] -> St.State CStateOrError ()
 appendAccm texts = eitherModify $ \s -> s {accm = accm s ++ texts}
 
 infixExec :: Text -> CNode -> CNode -> St.State CStateOrError ()
-infixExec func arg0@(LoadVar var0@(VarName varName0)) arg1@(LoadVar var1@(VarName varName1)) = do
+infixExec func arg0@LoadVar {var = var0@(VarName varName0)} arg1@LoadVar {var = var1@(VarName varName1)} = do
   unwrapGet $ \s ->
     case (vars s !? varName0, vars s !? varName1) of
       (Nothing, _) -> throwNasmGenError arg0 $ VariableNotDefined var0
@@ -317,26 +306,26 @@ infixExec func arg0@(LoadVar var0@(VarName varName0)) arg1@(LoadVar var1@(VarNam
         if ctype0 == ctype1
         then mapM_ cnode2nasm [arg0, arg1]
         else case (ctype0, ctype1) of
-          (CLong, Ptr CLong)   -> do cnode2nasm arg0
-                                     push "8"
-                                     stackExec "*"
-                                     cnode2nasm arg1
-          (Ptr CLong, CLong)   -> do cnode2nasm arg0
-                                     cnode2nasm arg1
-                                     push "8"
-                                     stackExec "*"
-          (CLong, Ptr (Ptr _)) -> do cnode2nasm arg0
-                                     push "8"
-                                     stackExec "*"
-                                     cnode2nasm arg1
-          (Ptr (Ptr _), CLong) -> do cnode2nasm arg0
-                                     cnode2nasm arg1
-                                     push "8"
-                                     stackExec "*"
-          (ctype0, ctype1) -> throwNasmGenError arg0 $ UnmatchedType var0 ctype0 ctype1
+          (Long, Ptr Long)    -> do cnode2nasm arg0
+                                    push "8"
+                                    stackExec "*"
+                                    cnode2nasm arg1
+          (Ptr Long, Long)    -> do cnode2nasm arg0
+                                    cnode2nasm arg1
+                                    push "8"
+                                    stackExec "*"
+          (Long, Ptr (Ptr _)) -> do cnode2nasm arg0
+                                    push "8"
+                                    stackExec "*"
+                                    cnode2nasm arg1
+          (Ptr (Ptr _), Long) -> do cnode2nasm arg0
+                                    cnode2nasm arg1
+                                    push "8"
+                                    stackExec "*"
+          (ctype0, ctype1)    -> throwNasmGenError arg0 $ UnmatchedType var0 ctype0 ctype1
   stackExec func
 
-infixExec func arg0@(LoadVar var@(VarName varName)) arg1 = do
+infixExec func arg0@LoadVar {var = var@(VarName varName)} arg1 = do
   cnode2nasm arg0
   cnode2nasm arg1
   unwrapGet $ \s ->
@@ -345,13 +334,13 @@ infixExec func arg0@(LoadVar var@(VarName varName)) arg1 = do
     (\(ctype, _) -> case ctype of
                            Ptr (Ptr _) -> do push "8"
                                              stackExec "*"
-                           Ptr CLong   -> do push "8"
+                           Ptr Long    -> do push "8"
                                              stackExec "*"
                            _           -> modify id)
     $ vars s !? varName
   stackExec func
 
-infixExec func arg0 arg1@(LoadVar var@(VarName varName)) = do
+infixExec func arg0 arg1@LoadVar {var = var@(VarName varName)} = do
   cnode2nasm arg0
   unwrapGet $ \s ->
     maybe
@@ -359,7 +348,7 @@ infixExec func arg0 arg1@(LoadVar var@(VarName varName)) = do
     (\(ctype, _) -> case ctype of
                            Ptr (Ptr _) -> do push "8"
                                              stackExec "*"
-                           Ptr CLong   -> do push "8"
+                           Ptr Long    -> do push "8"
                                              stackExec "*"
                            _           -> modify id)
     $ vars s !? varName
@@ -427,11 +416,6 @@ stackLoadLval :: (Integral a, Show a) => a -> St.State CStateOrError ()
 stackLoadLval theoffset = do
   push ("[rbp-" <> tshow theoffset <> "]")
   nl
-
--- genLVal :: (Integral a, Show a) => a -> St.State CStateOrError ()
--- genLVal theoffset = do
---   mov "rax" "rbp"
---   matchCommand "-" "rax" (tshow theoffset)
 
 push :: Text -> St.State CStateOrError ()
 push num =
