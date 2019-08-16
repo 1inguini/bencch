@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 
 long foo(void) {
     printf("function foo called\n");
@@ -22,8 +23,13 @@ long show_long(long num) {
     return num;
 }
 
-int main() {
-    long x;
-    for (x = 0; x < 100000000000000; x = x + 1) show_long(x);
-    return 0;
+void alloc4(long** p, long a, long b, long c, long d) {
+    *p = malloc(4 * 4);
+    (*p)[0] = a;
+    *p = malloc(4 * 4);
+    (*p)[0] = b;
+    *p = malloc(4 * 4);
+    (*p)[0] = c;
+    *p = malloc(4 * 4);
+    (*p)[0] = d;
 }
