@@ -31,16 +31,26 @@ angles    = between (symbol "<") (symbol ">")
 brackets  = between (symbol "[") (symbol "]")
 
 identifier, semicolon, comma, colon, dot :: Parser Text
-identifier =
-  spaceConsumer >> rawident <* spaceConsumer
+-- identifier =
+--   spaceConsumer >> rawident <* spaceConsumer
+--   where
+--     rawident = do
+--       head <- try letterChar
+--       rest <- many $ choice [try letterChar, try digitChar, try $ single '_']
+--       let ident = pack $ head:rest in
+--         if ident `elem` reserved
+--         then fail "reserved word"
+--         else return ident
+
+identifier = lexeme $ p >>= check
   where
-    rawident = do
-      head <- try letterChar
-      rest <- many $ choice [try letterChar, try digitChar, try $ single '_']
-      let ident = pack $ head:rest in
-        if ident `elem` reserved
-        then fail "reserved word"
-        else return ident
+    p       = do
+      x  <- letterChar
+      xs <- many alphaNumChar
+      pure . pack $ x:xs
+    check x = if x `elem` reserved
+                then fail $ "keyword " <> show x <> " cannot be an identifier"
+                else return x
 
 semicolon = symbol ";"
 comma     = symbol ","
@@ -162,25 +172,25 @@ pLhs = try $ choice
 pEquality = do
   arg0 <- pRelational
   option (arg0) (do eq   <- choice $ symbol <$> ["==", "!="]
-                    args <- pExpression
+                    args <- pRelational
                     return Funcall {funcName = eq, args = [arg0, args]})
 
 pRelational = do
   arg0 <- pAdd
   option (arg0) (do comp <- choice $ symbol <$> ["<=", ">=", ">", "<"]
-                    args <- pExpression
+                    args <- pAdd
                     return Funcall {funcName = comp, args = [arg0, args]})
 
 pAdd = do
   arg0 <- pMul
   option (arg0) (do arth <- choice $ symbol <$> ["+", "-"]
-                    args <- pExpression
+                    args <- pMul
                     return Funcall {funcName = arth, args = [arg0, args]})
 
 pMul = do
   arg0 <- pUnary
   option (arg0) (do arth <- choice $ symbol <$> ["*", "/"]
-                    args <- pExpression
+                    args <- pUnary
                     return Funcall {funcName = arth, args = [arg0, args]})
 
 pUnary = choice $ (genpUnary <$> unarysAndParsers) ++ [pTerm]

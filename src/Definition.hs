@@ -5,19 +5,12 @@
 module Definition where
 
 import           Control.Monad.State as St
-import           Control.Monad.State as St
-import           Data.Either         as E
 import           Data.Either         as E
 import           Data.Map.Strict     as Map
-import           Data.Map.Strict     as Map
 import           Data.Maybe          as May
-import           Data.Maybe          as May
-import           Data.Text.Lazy      as T
 import           Data.Text.Lazy      as T
 import qualified Data.Void           as V
 import           Prelude             as P
-import           Prelude             as P
-import           Safe                as Safe
 import           Text.Megaparsec     as MP
 
 type Parser = Parsec V.Void Text
@@ -86,16 +79,18 @@ data CState = CState
             , defName :: Text
             } deriving (Show, Eq)
 
-data NasmGenError = VariableNotDefined     Lhs
-                  | MultipleDeclaration    Text
-                  | VariableNotInitialized {var :: Lhs}
-                  | VariableUnknownType    {var :: Lhs, mayval :: Maybe CNode}
-                  | UnknownCValue          CValue
-                  | UnmatchedType          {var :: Lhs, oldCtype, newCtype :: CType}
-                  | UnmatchedArgNum        {funcName :: Text, argsgot :: [CNode]}
-                  deriving (Show, Eq)
+data NasmGenError
+  = VariableNotDefined     Lhs
+  | MultipleDeclaration    Text
+  | VariableNotInitialized {var :: Lhs}
+  | VariableUnknownType    {var :: Lhs, mayval :: Maybe CNode}
+  | UnknownCValue          CValue
+  | UnmatchedType          {var :: Lhs, oldCtype, newCtype :: CType}
+  | UnmatchedArgNum        {funcName :: Text, argsgot :: [CNode]}
+  deriving (Show, Eq)
 
-type CStateOrError = Either (CState, CNode, NasmGenError) CState
+type CStateOrError =
+  Either (CState, CNode, NasmGenError) CState
 
 unarys :: [Text]
 unarys = ["+", "-", "*", "&"]

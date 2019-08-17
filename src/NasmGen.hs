@@ -131,8 +131,8 @@ cnode2nasm (Branch nodeList) =
   mapM_ cnode2nasm nodeList
 cnode2nasm (Expression node) = do
   appendAccm
-    $ P.map (";; " <>) ( T.lines $ PrettyS.pShowNoColor node)
-    ++ [ ";; statement start"]
+    $ [ ";; statement start"]
+    ++ P.map (";; " <>) ( T.lines $ PrettyS.pShowNoColor node)
   cnode2nasm node
   pop "rax"
   appendAccm [ ";; statement end"]
