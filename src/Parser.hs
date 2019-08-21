@@ -9,7 +9,7 @@ import           Definition
 import           Control.Monad.State        as St
 import           Data.Text.Lazy             as T
 import           Prelude                    as P
-import           Safe                       as Safe
+import           Safe
 import           Text.Megaparsec            as MP
 import           Text.Megaparsec.Char
 import qualified Text.Megaparsec.Char.Lexer as L
@@ -42,15 +42,14 @@ identifier, semicolon, comma, colon, dot :: Parser Text
 --         then fail "reserved word"
 --         else return ident
 
-identifier = lexeme $ p >>= check
+identifier = lexeme $ check =<<
+  (do x  <- letterChar
+      xs <- many (try alphaNumChar <|> single '_')
+      pure . pack $ x:xs)
   where
-    p       = do
-      x  <- letterChar
-      xs <- many alphaNumChar
-      pure . pack $ x:xs
     check x = if x `elem` reserved
                 then fail $ "keyword " <> show x <> " cannot be an identifier"
-                else return x
+                else pure x
 
 semicolon = symbol ";"
 comma     = symbol ","
@@ -79,14 +78,16 @@ pDeclare = pDeclareFunction
 
 pDeclareFunction :: Parser TopLevel
 pDeclareFunction = do
-  ctypeName           <- spaceConsumer >> many letterChar
-  funcName            <- identifier
-  args                <- parens $ pDefVar `sepBy` comma
-  (Branch definition) <- blockStmt
-  return DeFun { ctype = case ctypeName of
-                           "long" -> Long
-                           _      -> Unknown
-               , funcName = funcName, args = args, definition = definition}
+  ctypeName         <- lexeme $ many letterChar
+  funcName          <- identifier
+  args              <- parens $ pDefVar `sepBy` comma
+  Branch definition <- blockStmt
+  pure DeFun { ctype      = case ctypeName of
+                              "long" -> Long
+                              _      -> Unknown
+             , funcName   = funcName
+             , args       = args
+             , definition = definition}
 
 pStatement, pExpression, pDefVar, pDefLong, pLoadVar, pEquality, pRelational, pAdd, pMul, pTerm, pLong, pUnary, pFuncall
   :: Parser CNode
@@ -119,12 +120,12 @@ pDefLong = symbol "long" >>
 
 pPtrTo :: CType -> Parser CType
 pPtrTo ctype = choice [ symbol "*" >> Ptr <$> pPtrTo ctype
-                      , return ctype]
+                      , pure ctype]
 
 whileStmt = do
   cond <- symbol "while" >> parens (Expression <$> pEquality)
   stmt <- pStatement
-  return $ CtrlStruct Whl {cond = cond, stmt = stmt}
+  pure $ CtrlStruct Whl {cond = cond, stmt = stmt}
 
 forStmt = do
   init <- symbol "for" >>
@@ -133,20 +134,20 @@ forStmt = do
                      cond    <- option Void (Expression <$> pEquality)
                      _       <- semicolon
                      finexpr <- option Void (Expression <$> pAssign)
-                     return For { init    = init
+                     pure For { init    = init
                                 , cond    = cond
                                 , finexpr = finexpr
                                 , stmt    = Branch [] })
   stmt <- pStatement
-  return $ CtrlStruct init { stmt = stmt }
+  pure $ CtrlStruct init { stmt = stmt }
 
 ifStmt = do
   cond <- symbol "if" >> parens (Expression <$> pEquality)
   stmt <- pStatement
   elst <- option Void (symbol "else" >> pStatement)
-  return $ CtrlStruct If { cond = cond, stmt = stmt, elst = elst }
+  pure $ CtrlStruct If { cond = cond, stmt = stmt, elst = elst }
 
-blockStmt = Branch <$> (braces $ many pStatement)
+blockStmt = Branch <$> braces (many pStatement)
 
 simpleStmt = Expression <$> pExpression <* semicolon
 
@@ -160,38 +161,52 @@ pAssign = try $ do
   ctype <- pPtrTo Unknown
   var   <- pLhs <* symbol "="
   val   <- pExpression
-  return AssignVar {ctype = ctype, var = var, val = val}
+  pure AssignVar {ctype = ctype, var = var, val = val}
 
 pLhs :: Parser Lhs
 pLhs = try $ choice
        [ try $ symbol "*" >> PtrTo <$> pUnary
        , VarName <$> identifier]
-  -- where
-  --   pPtr = genpUnary ("*", pTerm)
 
 pEquality = do
-  arg0 <- pRelational
-  option (arg0) (do eq   <- choice $ symbol <$> ["==", "!="]
-                    args <- pRelational
-                    return Funcall {funcName = eq, args = [arg0, args]})
+  fstArg <- pRelational
+  argAndOps <- MP.many $ MP.try $
+               (\op rightArg pointFreeLeftArg ->
+                  Funcall { funcName = op
+                          , args = [pointFreeLeftArg, rightArg]})
+               <$> choice (symbol <$> ["==", "!="])
+               <*> pRelational
+  pure $ P.foldr (flip (.)) id argAndOps fstArg
 
 pRelational = do
-  arg0 <- pAdd
-  option (arg0) (do comp <- choice $ symbol <$> ["<=", ">=", ">", "<"]
-                    args <- pAdd
-                    return Funcall {funcName = comp, args = [arg0, args]})
+  fstArg <- pAdd
+  argAndOps <- MP.many $ MP.try $
+               (\op rightArg pointFreeLeftArg ->
+                  Funcall { funcName = op
+                          , args = [pointFreeLeftArg, rightArg]})
+               <$> choice (symbol <$> ["<=", ">=", ">", "<"])
+               <*> pAdd
+  pure $ P.foldr (flip (.)) id argAndOps fstArg
 
 pAdd = do
-  arg0 <- pMul
-  option (arg0) (do arth <- choice $ symbol <$> ["+", "-"]
-                    args <- pMul
-                    return Funcall {funcName = arth, args = [arg0, args]})
+  fstArg <- pMul
+  argAndOps <- MP.many $ MP.try $
+               (\op rightArg pointFreeLeftArg ->
+                  Funcall { funcName = op
+                          , args = [pointFreeLeftArg, rightArg]})
+               <$> choice (symbol <$> ["+", "-"])
+               <*> pMul
+  pure $ P.foldr (flip (.)) id argAndOps fstArg
 
 pMul = do
-  arg0 <- pUnary
-  option (arg0) (do arth <- choice $ symbol <$> ["*", "/"]
-                    args <- pUnary
-                    return Funcall {funcName = arth, args = [arg0, args]})
+  fstArg <- pUnary
+  argAndOps <- MP.many $ MP.try $
+               (\op rightArg pointFreeLeftArg ->
+                  Funcall { funcName = op
+                          , args = [pointFreeLeftArg, rightArg]})
+               <$> choice (symbol <$> ["*", "/"])
+               <*> pUnary
+  pure $ P.foldr (flip (.)) id argAndOps fstArg
 
 pUnary = choice $ (genpUnary <$> unarysAndParsers) ++ [pTerm]
 
@@ -209,10 +224,10 @@ pTerm = choice
 pFuncall = try $ do
   func <- identifier
   args <- parens $ option [] (pExpression `sepBy` comma)
-  return Funcall {funcName = func, args = args}
+  pure Funcall {funcName = func, args = args}
 
 pLoadVar = do
   var <- pLhs
-  return LoadVar {ctype = Unknown, var = var}
+  pure LoadVar {ctype = Unknown, var = var}
 
 pLong = (\num -> Value CValue {ctype = Long, val = num}) <$> try integer

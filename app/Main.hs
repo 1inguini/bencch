@@ -22,14 +22,14 @@ main = do
   input <- pack . List.head <$> Env.getArgs
   case parse mainParser "" input of
     Right parsed -> do
-      -- putStrLn . unpack . PrettyS.pShow
-      --   $ parsed
-      case program2nasm parsed of
-        Right nasm ->
-          mapM_ (putStrLn . unpack) $ nasm
-        Left err   ->
-          putStrLn . unpack . PrettyS.pShow
-          $ err
+      putStrLn . unpack . PrettyS.pShow
+        $ parsed
+      -- case program2nasm parsed of
+      --   Right nasm ->
+      --     mapM_ (putStrLn . unpack) nasm
+      --   Left err   ->
+      --     putStrLn . unpack . PrettyS.pShow
+      --     $ err
     Left err  ->
       putStrLn $ MP.E.errorBundlePretty err
 
